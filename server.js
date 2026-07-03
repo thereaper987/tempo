@@ -11,16 +11,50 @@ const path = require('path');
 const os = require('os');
 const cors = require('cors');
 const multer = require('multer');
+require('dotenv').config();
 
 const app = express();
 const execPromise = util.promisify(exec);
 
 // ============================================
-// HARDCODED CONFIGURATION
+// CORS CONFIGURATION
+// ============================================
+const allowedOrigins = [
+    'https://kushalkumarj2006.github.io',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'https://colabbridge-jyba.onrender.com'
+];
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        console.warn(`❌ CORS blocked: ${origin}`);
+        return callback(new Error('Not allowed by CORS'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'api-secret', 'x-api-secret', 'Authorization'],
+    exposedHeaders: ['Content-Type', 'api-secret'],
+    credentials: true,
+    maxAge: 86400
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ============================================
+// HARDCODED CONFIGURATION (except env vars)
 // ============================================
 const CONFIG = {
-    COLAB_AUTH_TOKEN: '{"token": "ya29.a0AT3oNZ_JYRY15EBiIMfpxN8IXtFW43Kr3rj18eTv4QRiQr7O9Q-ZKr1Z_mUa2yJH1Aa63lT-DmvxCFqTuSLMMDBfe_mw0xg84cA20w2cAeTJ8DXF_ijdbUg4DUpH2s4XGSdX69ThTtizQNPsc4K60ykHkGnlmt8-W3o1Qb2nVOvP7oryE5gJW5fv4CGudryvYM-MWZQaCgYKAQwSARISFQHGX2Mi6_aFT-RRKHiy45bJg0mKcA0206", "refresh_token": "1//0g4sUFmaXGfvtCgYIARAAGBASNwF-L9IrYGPrhpvZRm7LOnSWxZfdVJGFpzmxEE0vrosqyFaObsZ7eJdDHKbaR1iS2-vhxoCU5Xs", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-06-15T07:29:05Z"}',
-
+    // ✅ From environment variables
+    COLAB_AUTH_TOKEN: process.env.COLAB_AUTH_TOKEN || '{"token": "ya29.a0AT3oNZ_JYRY15EBiIMfpxN8IXtFW43Kr3rj18eTv4QRiQr7O9Q-ZKr1Z_mUa2yJH1Aa63lT-DmvxCFqTuSLMMDBfe_mw0xg84cA20w2cAeTJ8DXF_ijdbUg4DUpH2s4XGSdX69ThTtizQNPsc4K60ykHkGnlmt8-W3o1Qb2nVOvP7oryE5gJW5fv4CGudryvYM-MWZQaCgYKAQwSARISFQHGX2Mi6_aFT-RRKHiy45bJg0mKcA0206", "refresh_token": "1//0g4sUFmaXGfvtCgYIARAAGBASNwF-L9IrYGPrhpvZRm7LOnSWxZfdVJGFpzmxEE0vrosqyFaObsZ7eJdDHKbaR1iS2-vhxoCU5Xs", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-06-15T07:29:05Z"}',
+    
+    // Hardcoded values
     PORT: 10000,
     SESSIONS_BASE_DIR: '/tmp/colab_sessions',
     UPLOAD_DIR: '/tmp/colab_uploads',
@@ -33,6 +67,22 @@ const CONFIG = {
     CLEANUP_INTERVAL: 3600000,
     COMPLETED_EXECUTIONS_TTL: 1200000,
 };
+
+// ============================================
+// API SECRET VALIDATION
+// ============================================
+const API_SECRET = process.env.API_SECRET;
+
+function validateApiSecret(input) {
+    if (!input) return false;
+    return input === API_SECRET;
+}
+
+function extractApiSecret(req) {
+    return req.body?.api_secret || 
+           req.headers['api-secret'] || 
+           req.headers['x-api-secret'];
+}
 
 // ============================================
 // STATE MANAGEMENT
@@ -69,14 +119,6 @@ const logInfo = (msg, data) => log('info', msg, data);
 const logWarn = (msg, data) => log('warn', msg, data);
 const logError = (msg, data) => log('error', msg, data);
 const logSuccess = (msg, data) => log('success', msg, data);
-
-// ============================================
-// CORS
-// ============================================
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
-app.options('*', cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============================================
 // REQUEST LOGGING MIDDLEWARE
@@ -574,7 +616,7 @@ async function backgroundExecution(sessionId, cellNo, code, executionId) {
 }
 
 // ============================================
-// HEALTH ENDPOINTS
+// HEALTH ENDPOINTS (Public)
 // ============================================
 app.get('/health', (req, res) => {
     const mem = process.memoryUsage();
@@ -599,7 +641,7 @@ app.get('/health/simple', (req, res) => {
 });
 
 // ============================================
-// HELP ENDPOINT
+// HELP ENDPOINT (Public)
 // ============================================
 app.get('/', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
@@ -650,7 +692,7 @@ app.get('/', (req, res) => {
 });
 
 // ============================================
-// SESSION ENDPOINTS
+// SESSION ENDPOINTS (Public)
 // ============================================
 
 app.get('/sessions', async (req, res) => {
@@ -738,9 +780,23 @@ app.get('/sessions/:identifier', async (req, res) => {
 });
 
 // ============================================
+// PROTECTED ENDPOINTS (Auth Required)
+// ============================================
+
+// Middleware to check API secret
+function requireAuth(req, res, next) {
+    const apiSecret = extractApiSecret(req);
+    if (!validateApiSecret(apiSecret)) {
+        logWarn(`🔒 Auth failed for ${req.method} ${req.path}`);
+        return res.status(401).json({ error: 'Invalid API secret' });
+    }
+    next();
+}
+
+// ============================================
 // SESSION CREATION WITH AUTO-EVICTION - FIXED
 // ============================================
-app.post('/new', async (req, res) => {
+app.post('/new', requireAuth, async (req, res) => {
     logInfo('Creating new session', { body: req.body });
     
     // Clean up any orphaned sessions first
@@ -850,7 +906,7 @@ app.post('/new', async (req, res) => {
 // ============================================
 // SESSION STOP/DELETE - FIXED: Handle missing sessions gracefully
 // ============================================
-app.post('/stop', async (req, res) => {
+app.post('/stop', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
@@ -879,7 +935,7 @@ app.post('/stop', async (req, res) => {
     res.json({ success: true, sessionId: resolvedId, message: 'Session stopped' });
 });
 
-app.delete('/session/:sessionId', async (req, res) => {
+app.delete('/session/:sessionId', requireAuth, async (req, res) => {
     const { sessionId } = req.params;
     const found = resolveSession(sessionId);
     if (!found) {
@@ -892,7 +948,7 @@ app.delete('/session/:sessionId', async (req, res) => {
     return res.json({ success: true, sessionId: resolvedId, message: 'Session terminated' });
 });
 
-app.post('/keepalive', async (req, res) => {
+app.post('/keepalive', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
@@ -931,7 +987,7 @@ app.post('/keepalive', async (req, res) => {
 // EXECUTION ENDPOINTS
 // ============================================
 
-app.post('/exec', async (req, res) => {
+app.post('/exec', requireAuth, async (req, res) => {
     const { sessionId, code, cellNo } = req.body;
     
     const validCellNo = parseInt(cellNo, 10);
@@ -1046,7 +1102,7 @@ app.all('/exec-status', async (req, res) => {
     });
 });
 
-app.post('/exec-ack', async (req, res) => {
+app.post('/exec-ack', requireAuth, async (req, res) => {
     const { executionId } = req.body;
     if (executionId && completedExecutions.has(executionId)) {
         completedExecutions.delete(executionId);
@@ -1056,7 +1112,7 @@ app.post('/exec-ack', async (req, res) => {
     res.json({ success: false, executionId, message: 'Execution not found' });
 });
 
-app.post('/restart-kernel', async (req, res) => {
+app.post('/restart-kernel', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
@@ -1096,7 +1152,7 @@ app.post('/restart-kernel', async (req, res) => {
 // FILE OPERATIONS
 // ============================================
 
-app.post('/download', async (req, res) => {
+app.post('/download', requireAuth, async (req, res) => {
     const { sessionId, remotePath, localPath } = req.body;
     
     logInfo(`Downloading file`, { sessionId: sessionId?.substring(0, 12), remotePath });
@@ -1284,7 +1340,7 @@ app.get('/retrieve-file', async (req, res) => {
     res.status(404).json({ error: 'File not found on server. Run /download first.' });
 });
 
-app.post('/upload', (req, res) => {
+app.post('/upload', requireAuth, (req, res) => {
     upload.single('file')(req, res, async (err) => {
         if (err) {
             return res.status(500).json({
@@ -1456,7 +1512,7 @@ app.get('/ls', async (req, res) => {
 // ============================================
 // RM - FIXED: Handle files that don't exist gracefully
 // ============================================
-app.post('/rm', async (req, res) => {
+app.post('/rm', requireAuth, async (req, res) => {
     const { sessionId, path: remotePath } = req.body;
     
     if (!sessionId || !remotePath) {
@@ -1504,7 +1560,7 @@ app.post('/rm', async (req, res) => {
 // AUTOMATION COMMANDS
 // ============================================
 
-app.post('/install', async (req, res) => {
+app.post('/install', requireAuth, async (req, res) => {
     const { sessionId, packages, requirement } = req.body;
     
     if (!sessionId) {
@@ -1805,7 +1861,7 @@ app.get('/skill', async (req, res) => {
 // INTERACTIVE COMMANDS WITH PROPER RESPONSES
 // ============================================
 
-app.post('/drivemount', async (req, res) => {
+app.post('/drivemount', requireAuth, async (req, res) => {
     const { sessionId, path: mountPath } = req.body;
     logInfo('Drive mount requested', { sessionId: sessionId?.substring(0, 12) });
     
@@ -1910,7 +1966,7 @@ app.post('/drivemount', async (req, res) => {
     }
 });
 
-app.post('/auth', async (req, res) => {
+app.post('/auth', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     logInfo('Auth requested', { sessionId: sessionId?.substring(0, 12) });
     
@@ -1937,7 +1993,7 @@ app.post('/auth', async (req, res) => {
     });
 });
 
-app.post('/console', async (req, res) => {
+app.post('/console', requireAuth, async (req, res) => {
     const { sessionId } = req.body;
     logInfo('Console requested', { sessionId: sessionId?.substring(0, 12) });
     
@@ -1961,7 +2017,7 @@ app.post('/console', async (req, res) => {
     });
 });
 
-app.post('/repl', async (req, res) => {
+app.post('/repl', requireAuth, async (req, res) => {
     const { sessionId, code } = req.body;
     logInfo('REPL requested', { sessionId: sessionId?.substring(0, 12), hasCode: !!code });
     
@@ -2029,7 +2085,7 @@ app.post('/repl', async (req, res) => {
     }
 });
 
-app.post('/edit', async (req, res) => {
+app.post('/edit', requireAuth, async (req, res) => {
     const { sessionId, remotePath } = req.body;
     logInfo('Edit requested', { sessionId: sessionId?.substring(0, 12), remotePath });
     
@@ -2057,7 +2113,7 @@ app.post('/edit', async (req, res) => {
 // ============================================
 // STATELESS RUN ENDPOINT - FIXED: Better error handling and temp script creation
 // ============================================
-app.post('/run', async (req, res) => {
+app.post('/run', requireAuth, async (req, res) => {
     const { script, gpu, keep, timeout, sessionName } = req.body;
     logInfo('Running script (stateless)', { script, gpu });
 
@@ -2282,6 +2338,9 @@ async function init() {
         logInfo(`⚡ /run: Stateless with temp script support`);
         logInfo(`\n📡 Health: http://localhost:${PORT}/health`);
         logInfo(`📖 Help: http://localhost:${PORT}/`);
+        logInfo(`🔐 API Secret: ${API_SECRET ? '✅ Configured' : '⚠️ Not set'}`);
+        logInfo(`🔑 Colab Auth: ${process.env.COLAB_AUTH_TOKEN ? '✅ Configured' : '⚠️ Not set'}`);
+        logInfo(`🔒 CORS: ${allowedOrigins.length} allowed origins`);
         logSuccess('\n🚀 Ready!');
     });
 }
