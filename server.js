@@ -1,5 +1,5 @@
 // ============================================
-// COLAB ORCHESTRATOR - COMPLETE FIXED VERSION
+// COLAB ORCHESTRATOR - COMPLETE FIXED VERSION v3.2
 // ============================================
 const express = require('express');
 const { spawn, exec } = require('child_process');
@@ -270,29 +270,6 @@ async function runColabCli(args, timeout = 30000) {
             }
             
             if (error && error.code !== 0) {
-                // Check if it's a TooManyAssignmentsError
-                const errorMsg = stderr || error.message || '';
-                if (errorMsg.includes('TooManyAssignmentsError') || errorMsg.includes('Precondition Failed')) {
-                    logWarn('Too many assignments - cleaning up orphaned sessions');
-                    // Try to list and clean up
-                    exec(`${COLAB_BINARY} sessions`, { timeout: 10000 }, (listErr, listOut) => {
-                        if (!listErr && listOut) {
-                            const sessions = listOut.split('\n').filter(s => s.trim() && s.includes('|'));
-                            logInfo(`Found ${sessions.length} sessions to clean up`);
-                            // Try to stop each one (they're orphaned anyway)
-                            for (const sess of sessions) {
-                                const match = sess.match(/\[(.*?)\]/);
-                                if (match) {
-                                    const name = match[1];
-                                    if (name !== '?' && !name.includes('colab_')) {
-                                        exec(`${COLAB_BINARY} stop -s "${name}"`, { timeout: 5000 }, () => {});
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-                
                 logError(`Command failed with code ${error.code}`, { 
                     command: command.substring(0, 100),
                     error: error.message,
@@ -392,25 +369,50 @@ async function cleanupSessionFolder(sessionId) {
 }
 
 // ============================================
-// CLEANUP ORPHANED SESSIONS
+// CLEANUP ORPHANED SESSIONS - ENHANCED
 // ============================================
 async function cleanupOrphanedSessions() {
     try {
-        const result = await runColabCli(['sessions'], 10000);
-        const lines = result.stdout.split('\n').filter(s => s.trim());
-        const orphaned = lines.filter(s => s.includes('[?]'));
+        logInfo('🧹 Checking for orphaned sessions...');
+        const result = await runColabCli(['sessions'], 15000);
+        const lines = result.stdout.split('\n').filter(s => s.trim() && s.includes('|'));
         
-        for (const orphan of orphaned) {
-            // Extract endpoint from the line
-            const match = orphan.match(/\?\]\s+([^\s]+)/);
-            if (match) {
-                const endpoint = match[1];
-                logWarn(`Found orphaned session: ${endpoint}`);
-                try {
-                    await runColabCli(['stop', '-s', endpoint], 5000);
-                    logSuccess(`Cleaned up orphaned session: ${endpoint}`);
-                } catch (e) {
-                    logDebug(`Could not stop orphaned session: ${endpoint}`, e.message);
+        for (const line of lines) {
+            // Check if it's an orphaned session
+            const isOrphaned = line.includes('[?]');
+            if (isOrphaned) {
+                const match = line.match(/\?\]\s+([^\s]+)/);
+                if (match) {
+                    const endpoint = match[1];
+                    logWarn(`Found orphaned session: ${endpoint}`);
+                    try {
+                        await runColabCli(['stop', '-s', endpoint], 10000);
+                        logSuccess(`Cleaned up orphaned session: ${endpoint}`);
+                    } catch (e) {
+                        logDebug(`Could not stop orphaned session: ${endpoint}`, e.message);
+                    }
+                }
+            }
+            
+            // Check if it's a session not in our local map
+            const nameMatch = line.match(/\[(.*?)\]/);
+            if (nameMatch && nameMatch[1] !== '?') {
+                const sessionName = nameMatch[1];
+                let found = false;
+                for (const [id, s] of sessions.entries()) {
+                    if (s.colabSession === sessionName) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && !sessionName.startsWith('colab_')) {
+                    logWarn(`Found unknown session: ${sessionName}`);
+                    try {
+                        await runColabCli(['stop', '-s', sessionName], 10000);
+                        logSuccess(`Cleaned up unknown session: ${sessionName}`);
+                    } catch (e) {
+                        logDebug(`Could not stop unknown session: ${sessionName}`, e.message);
+                    }
                 }
             }
         }
@@ -422,11 +424,11 @@ async function cleanupOrphanedSessions() {
 // Run orphan cleanup on startup and periodically
 setTimeout(() => {
     cleanupOrphanedSessions();
-}, 5000);
+}, 3000);
 
 setInterval(() => {
     cleanupOrphanedSessions();
-}, 5 * 60 * 1000); // Every 5 minutes
+}, 3 * 60 * 1000); // Every 3 minutes
 
 // ============================================
 // SESSION DATA JSON MANAGEMENT
@@ -655,7 +657,7 @@ app.get('/', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
         name: "Colab Orchestrator API",
-        version: "3.1.0",
+        version: "3.2.0",
         description: "REST API wrapper around Google Colab CLI",
         baseUrl: baseUrl,
         endpoints: {
@@ -1863,7 +1865,9 @@ app.post('/edit', async (req, res) => {
     });
 });
 
-// POST /run - Run script
+// ============================================
+// FIXED RUN ENDPOINT - CRITICAL FIX
+// ============================================
 app.post('/run', async (req, res) => {
     const { script, gpu, keep, timeout, sessionName } = req.body;
     logInfo('Running script', { script, gpu });
@@ -1872,6 +1876,40 @@ app.post('/run', async (req, res) => {
         return res.status(400).json({ error: 'script path required' });
     }
 
+    // STEP 1: Clean up orphaned sessions aggressively
+    await cleanupOrphanedSessions();
+
+    // STEP 2: Force cleanup any unknown sessions
+    try {
+        const result = await runColabCli(['sessions'], 10000);
+        const lines = result.stdout.split('\n').filter(s => s.trim() && s.includes('|'));
+        for (const line of lines) {
+            const nameMatch = line.match(/\[(.*?)\]/);
+            if (nameMatch && nameMatch[1] !== '?') {
+                const sessionName = nameMatch[1];
+                let isTracked = false;
+                for (const [id, s] of sessions.entries()) {
+                    if (s.colabSession === sessionName) {
+                        isTracked = true;
+                        break;
+                    }
+                }
+                if (!isTracked && !sessionName.startsWith('colab_')) {
+                    logWarn(`Found untracked session: ${sessionName}, stopping...`);
+                    try {
+                        await runColabCli(['stop', '-s', sessionName], 10000);
+                        logSuccess(`Stopped untracked session: ${sessionName}`);
+                    } catch (e) {
+                        logDebug(`Could not stop untracked session: ${sessionName}`, e.message);
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        logDebug('Session cleanup error:', e.message);
+    }
+
+    // STEP 3: Create temp script
     let actualScript = script;
     try {
         await fs.access(script);
@@ -1895,33 +1933,83 @@ print("✅ Script completed!")
         logInfo(`Created temporary script: ${actualScript}`);
     }
 
+    // STEP 4: Use a unique session name with timestamp
+    const uniqueSessionName = sessionName || `run_${Date.now().toString(36)}`;
     const args = ['run', actualScript];
     if (gpu) args.push('--gpu', gpu);
     if (keep) args.push('--keep');
     if (timeout) args.push('--timeout', timeout?.toString() || '30');
-    if (sessionName) args.push('-s', sessionName);
+    args.push('-s', uniqueSessionName);
 
-    try {
-        const result = await runColabCli(args, 60000);
-        res.json({
-            success: true,
-            script: actualScript,
-            gpu: gpu || null,
-            keep: keep || false,
-            timeout: timeout || 30,
-            sessionName: sessionName || null,
-            output: result.stdout || '',
-            error: result.stderr || '',
-            message: 'Script executed on fresh VM'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            script: actualScript,
-            error: 'Script execution failed',
-            details: error.stderr || error.message || String(error)
-        });
+    logInfo(`Run command: ${args.join(' ')}`);
+
+    // STEP 5: Execute with retry
+    let attempt = 0;
+    const maxAttempts = 3;
+    let lastError = null;
+
+    while (attempt < maxAttempts) {
+        attempt++;
+        try {
+            const result = await runColabCli(args, 60000);
+            
+            // Success - clean up if not keep
+            if (!keep) {
+                try {
+                    await runColabCli(['stop', '-s', uniqueSessionName], 10000);
+                    logInfo(`Cleaned up run session: ${uniqueSessionName}`);
+                } catch (e) {
+                    logDebug(`Could not stop run session: ${uniqueSessionName}`, e.message);
+                }
+            }
+            
+            return res.json({
+                success: true,
+                script: actualScript,
+                gpu: gpu || null,
+                keep: keep || false,
+                timeout: timeout || 30,
+                sessionName: uniqueSessionName,
+                output: result.stdout || '',
+                error: result.stderr || '',
+                message: `Script executed on fresh VM (attempt ${attempt})`
+            });
+        } catch (error) {
+            lastError = error;
+            const errorMsg = error.stderr || error.message || '';
+            
+            if (errorMsg.includes('TooManyAssignmentsError') || errorMsg.includes('Precondition Failed')) {
+                logWarn(`Attempt ${attempt}: Too many assignments, cleaning up...`);
+                await cleanupOrphanedSessions();
+                
+                // Try to stop any session with our name
+                try {
+                    await runColabCli(['stop', '-s', uniqueSessionName], 5000);
+                } catch (e) {}
+                
+                if (attempt < maxAttempts) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    continue;
+                }
+            } else {
+                // Non-retryable error
+                return res.status(500).json({
+                    success: false,
+                    script: actualScript,
+                    error: 'Script execution failed',
+                    details: error.stderr || error.message || String(error)
+                });
+            }
+        }
     }
+
+    // All retries exhausted
+    return res.status(500).json({
+        success: false,
+        script: actualScript,
+        error: 'Script execution failed after all retries',
+        details: lastError?.stderr || lastError?.message || 'Unknown error'
+    });
 });
 
 // ============================================
@@ -1989,7 +2077,7 @@ app.use((req, res) => {
 // INIT
 // ============================================
 async function init() {
-    logInfo('🚀 Initializing Colab Orchestrator v3.1...');
+    logInfo('🚀 Initializing Colab Orchestrator v3.2 (FIXED)...');
 
     await initColabBinary();
     await fs.mkdir(CONFIG.SESSIONS_BASE_DIR, { recursive: true });
@@ -2003,7 +2091,7 @@ async function init() {
 
     const PORT = process.env.PORT || CONFIG.PORT;
     app.listen(PORT, () => {
-        logSuccess(`🚀 Colab Orchestrator v3.1 running on port ${PORT}`);
+        logSuccess(`🚀 Colab Orchestrator v3.2 running on port ${PORT}`);
         logInfo(`📁 Sessions: ${CONFIG.SESSIONS_BASE_DIR}`);
         logInfo(`📊 Max sessions: ${CONFIG.MAX_SESSIONS}`);
         logInfo(`🔧 Colab binary: ${COLAB_BINARY}${USE_PYTHON_MODULE ? ' (-m colab_cli)' : ''}`);
