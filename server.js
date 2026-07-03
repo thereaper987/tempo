@@ -1,5 +1,5 @@
 // ============================================
-// COLAB ORCHESTRATOR - FIXED VERSION
+// COLAB ORCHESTRATOR - FIXED VERSION WITH IMPROVED LOGGING
 // ============================================
 const express = require('express');
 const { spawn, exec } = require('child_process');
@@ -15,12 +15,49 @@ const app = express();
 const execPromise = util.promisify(exec);
 
 // ============================================
+// ENHANCED LOGGING
+// ============================================
+const LOG_LEVELS = {
+    DEBUG: 0,
+    INFO: 1,
+    WARN: 2,
+    ERROR: 3,
+    SUCCESS: 4
+};
+
+const LOG_LEVEL = LOG_LEVELS.DEBUG;
+
+function log(level, message, data = null) {
+    const timestamp = new Date().toISOString();
+    const prefix = {
+        [LOG_LEVELS.DEBUG]: '🔍',
+        [LOG_LEVELS.INFO]: 'ℹ️',
+        [LOG_LEVELS.WARN]: '⚠️',
+        [LOG_LEVELS.ERROR]: '❌',
+        [LOG_LEVELS.SUCCESS]: '✅'
+    }[level] || '📝';
+
+    if (level >= LOG_LEVEL) {
+        console.log(`[${timestamp}] ${prefix} ${message}`);
+        if (data) {
+            console.log(`   └─ ${JSON.stringify(data, null, 2)}`);
+        }
+    }
+}
+
+const logDebug = (msg, data) => log(LOG_LEVELS.DEBUG, msg, data);
+const logInfo = (msg, data) => log(LOG_LEVELS.INFO, msg, data);
+const logWarn = (msg, data) => log(LOG_LEVELS.WARN, msg, data);
+const logError = (msg, data) => log(LOG_LEVELS.ERROR, msg, data);
+const logSuccess = (msg, data) => log(LOG_LEVELS.SUCCESS, msg, data);
+
+// ============================================
 // HARDCODED CONFIGURATION (Testing Only)
 // ============================================
 const CONFIG = {
     COLAB_AUTH_TOKEN: '{"token": "ya29.a0AT3oNZ_JYRY15EBiIMfpxN8IXtFW43Kr3rj18eTv4QRiQr7O9Q-ZKr1Z_mUa2yJH1Aa63lT-DmvxCFqTuSLMMDBfe_mw0xg84cA20w2cAeTJ8DXF_ijdbUg4DUpH2s4XGSdX69ThTtizQNPsc4K60ykHkGnlmt8-W3o1Qb2nVOvP7oryE5gJW5fv4CGudryvYM-MWZQaCgYKAQwSARISFQHGX2Mi6_aFT-RRKHiy45bJg0mKcA0206", "refresh_token": "1//0g4sUFmaXGfvtCgYIARAAGBASNwF-L9IrYGPrhpvZRm7LOnSWxZfdVJGFpzmxEE0vrosqyFaObsZ7eJdDHKbaR1iS2-vhxoCU5Xs", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-06-15T07:29:05Z"}',
 
-    PORT: 3000,
+    PORT: 10000,
     SESSIONS_BASE_DIR: '/tmp/colab_sessions',
     UPLOAD_DIR: '/tmp/colab_uploads',
     MAX_SESSIONS: 3,
@@ -43,17 +80,66 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============================================
+// REQUEST LOGGING MIDDLEWARE
+// ============================================
+app.use((req, res, next) => {
+    const start = Date.now();
+    const { method, url, ip } = req;
+    const bodySize = req.body ? JSON.stringify(req.body).length : 0;
+    
+    logDebug(`📨 ${method} ${url}`, { ip, bodySize });
+    
+    // Log request body for debugging (truncated)
+    if (req.body && Object.keys(req.body).length > 0) {
+        const truncatedBody = { ...req.body };
+        if (truncatedBody.code) {
+            truncatedBody.code = truncatedBody.code.substring(0, 100) + '...';
+        }
+        logDebug(`   Body:`, truncatedBody);
+    }
+    
+    // Capture response
+    const originalSend = res.send;
+    let responseBody = null;
+    res.send = function(data) {
+        responseBody = data;
+        return originalSend.call(this, data);
+    };
+    
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        const status = res.statusCode;
+        const statusIcon = status >= 200 && status < 300 ? '✅' : status >= 400 ? '❌' : '⚠️';
+        logInfo(`${statusIcon} ${method} ${url} → ${status} (${duration}ms)`);
+        
+        if (status >= 400 && responseBody) {
+            const errorPreview = typeof responseBody === 'string' 
+                ? responseBody.substring(0, 500) 
+                : JSON.stringify(responseBody).substring(0, 500);
+            logDebug(`   Error response: ${errorPreview}`);
+        }
+    });
+    
+    next();
+});
+
+// ============================================
 // MULTER FOR FILE UPLOADS
 // ============================================
 const storage = multer.diskStorage({
     destination: async (req, file, cb) => {
         const sessionId = req.body.sessionId || req.query.sessionId;
-        if (!sessionId) return cb(new Error('sessionId required'));
+        if (!sessionId) {
+            logError('No sessionId provided for upload');
+            return cb(new Error('sessionId required'));
+        }
         const uploadDir = path.join(CONFIG.UPLOAD_DIR, sessionId);
         try {
             await fs.mkdir(uploadDir, { recursive: true });
+            logDebug(`Upload directory created: ${uploadDir}`);
             cb(null, uploadDir);
         } catch (error) {
+            logError(`Failed to create upload directory: ${uploadDir}`, error);
             cb(error);
         }
     },
@@ -62,6 +148,7 @@ const storage = multer.diskStorage({
         const uniqueName = `${timestamp}_${file.originalname}`;
         req.uploadedFileName = uniqueName;
         req.originalFileName = file.originalname;
+        logDebug(`Upload filename: ${uniqueName} (original: ${file.originalname})`);
         cb(null, uniqueName);
     }
 });
@@ -69,7 +156,10 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage,
     limits: { fileSize: CONFIG.MAX_FILE_SIZE },
-    fileFilter: (req, file, cb) => cb(null, true)
+    fileFilter: (req, file, cb) => {
+        logDebug(`File upload: ${file.originalname} (${file.mimetype})`);
+        cb(null, true);
+    }
 });
 
 // ============================================
@@ -80,28 +170,32 @@ let USE_PYTHON_MODULE = false;
 
 async function findColabBinary() {
     const { execSync } = require('child_process');
-    console.log('🔍 Searching for colab binary...');
+    logInfo('🔍 Searching for colab binary...');
 
     try {
         const whichPath = execSync('which colab 2>/dev/null || echo ""', { encoding: 'utf8', timeout: 5000 }).trim();
         if (whichPath && whichPath !== '') {
-            console.log(`✅ Found colab via which: ${whichPath}`);
+            logSuccess(`Found colab via which: ${whichPath}`);
             return whichPath;
         }
-    } catch (e) {}
+    } catch (e) {
+        logDebug('which colab failed', e.message);
+    }
 
     try {
         const pipPath = execSync('pip3 show google-colab-cli 2>/dev/null | grep Location | cut -d" " -f2', { encoding: 'utf8', timeout: 5000 }).trim();
         if (pipPath) {
             const possibleBinary = `${pipPath}/colab_cli/__main__.py`;
             if (require('fs').existsSync(possibleBinary)) {
-                console.log(`✅ Found colab via pip: ${possibleBinary}`);
+                logSuccess(`Found colab via pip: ${possibleBinary}`);
                 return 'python3';
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        logDebug('pip3 show failed', e.message);
+    }
 
-    console.warn('⚠️ colab binary not found, falling back to python3 -m colab_cli');
+    logWarn('colab binary not found, falling back to python3 -m colab_cli');
     return 'python3';
 }
 
@@ -110,16 +204,16 @@ async function initColabBinary() {
     if (binary === 'python3') {
         USE_PYTHON_MODULE = true;
         COLAB_BINARY = 'python3';
-        console.log(`🔧 Using Python module: python3 -m colab_cli`);
+        logInfo(`Using Python module: python3 -m colab_cli`);
     } else {
         COLAB_BINARY = binary;
         USE_PYTHON_MODULE = false;
-        console.log(`🔧 Using colab binary: ${COLAB_BINARY}`);
+        logInfo(`Using colab binary: ${COLAB_BINARY}`);
     }
 }
 
 // ============================================
-// COLAB CLI RUNNER
+// COLAB CLI RUNNER WITH ENHANCED LOGGING
 // ============================================
 async function runColabCli(args, timeout = 30000) {
     return new Promise((resolve, reject) => {
@@ -131,11 +225,26 @@ async function runColabCli(args, timeout = 30000) {
             const escapedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(' ');
             command = `${COLAB_BINARY} ${escapedArgs}`;
         }
-        console.log(`🛠  Running: ${command}`);
+        
+        logDebug(`🛠  Running: ${command}`, { timeout });
+        
         exec(command, { timeout, shell: '/bin/bash', maxBuffer: 50 * 1024 * 1024 }, (error, stdout, stderr) => {
+            if (stdout && stdout.length > 0) {
+                logDebug(`   STDOUT: ${stdout.substring(0, 200)}${stdout.length > 200 ? '...' : ''}`);
+            }
+            if (stderr && stderr.length > 0) {
+                logDebug(`   STDERR: ${stderr.substring(0, 200)}${stderr.length > 200 ? '...' : ''}`);
+            }
+            
             if (error && error.code !== 0) {
+                logError(`Command failed with code ${error.code}`, { 
+                    command: command.substring(0, 100),
+                    error: error.message,
+                    stderr: stderr.substring(0, 500)
+                });
                 reject({ error, stdout, stderr });
             } else {
+                logSuccess(`Command completed successfully`);
                 resolve({ stdout, stderr });
             }
         });
@@ -152,7 +261,7 @@ async function setupColabAuth() {
 
         if (tokenData.token && !tokenData.access_token) {
             tokenData.access_token = tokenData.token;
-            console.log('📝 Converted "token" → "access_token"');
+            logInfo('Converted "token" → "access_token"');
         }
 
         const configDir = path.join(os.homedir(), '.config/colab-cli');
@@ -162,13 +271,13 @@ async function setupColabAuth() {
 
         const verify = JSON.parse(await fs.readFile(path.join(configDir, 'token.json'), 'utf8'));
         if (verify.access_token) {
-            console.log('✅ Colab auth token written and verified');
+            logSuccess('Colab auth token written and verified');
             return true;
         }
-        console.warn('⚠️ Token written but no access_token found');
+        logWarn('Token written but no access_token found');
         return false;
     } catch (error) {
-        console.error('❌ Auth setup failed:', error.message);
+        logError('Auth setup failed:', error.message);
         return false;
     }
 }
@@ -193,6 +302,14 @@ function resolveSession(identifier) {
     return null;
 }
 
+function safeStringify(obj) {
+    try {
+        return JSON.stringify(obj, null, 2);
+    } catch {
+        return String(obj);
+    }
+}
+
 // ============================================
 // STATE MANAGEMENT
 // ============================================
@@ -212,7 +329,7 @@ setInterval(() => {
             cleaned++;
         }
     }
-    if (cleaned > 0) console.log(`🧹 Cleared ${cleaned} stale completed executions`);
+    if (cleaned > 0) logInfo(`Cleared ${cleaned} stale completed executions`);
 }, 60 * 1000);
 
 // Cleanup hanging processes
@@ -222,7 +339,7 @@ setInterval(() => {
             proc.kill(0);
             const session = Array.from(sessions.values()).find(s => s.currentExecution?.executionId === execId);
             if (session && Date.now() - session.currentExecution.startedAt > 2.5 * 60 * 60 * 1000) {
-                console.log(`⚠️ Killing hanging process ${execId}`);
+                logWarn(`Killing hanging process ${execId}`);
                 proc.kill('SIGTERM');
                 executionProcesses.delete(execId);
             }
@@ -242,7 +359,7 @@ setInterval(() => {
             cleaned++;
         }
     }
-    if (cleaned > 0) console.log(`🧹 Cleared ${cleaned} stale file transfers`);
+    if (cleaned > 0) logInfo(`Cleared ${cleaned} stale file transfers`);
 }, 60000);
 
 // ============================================
@@ -251,6 +368,7 @@ setInterval(() => {
 async function createSessionFolder(sessionId) {
     const folder = path.join(CONFIG.SESSIONS_BASE_DIR, sessionId);
     await fs.mkdir(folder, { recursive: true });
+    logDebug(`Session folder created: ${folder}`);
     return folder;
 }
 
@@ -258,9 +376,9 @@ async function cleanupSessionFolder(sessionId) {
     try {
         await fs.rm(path.join(CONFIG.SESSIONS_BASE_DIR, sessionId), { recursive: true, force: true });
         await fs.rm(path.join(CONFIG.UPLOAD_DIR, sessionId), { recursive: true, force: true });
-        console.log(`✅ Cleaned up folders for session ${sessionId}`);
+        logSuccess(`Cleaned up folders for session ${sessionId.substring(0, 12)}`);
     } catch (error) {
-        console.error(`Failed to cleanup folders for ${sessionId}:`, error.message);
+        logError(`Failed to cleanup folders for ${sessionId}`, error.message);
     }
 }
 
@@ -297,9 +415,10 @@ async function appendSessionData(sessionId, data) {
         sessionData.lastUpdated = new Date().toISOString();
 
         await fs.writeFile(dataFile, JSON.stringify(sessionData, null, 2));
+        logDebug(`Session data updated for ${sessionId.substring(0, 12)}`, { cellNo: data.cellNo, type: data.type });
         return sessionData;
     } catch (error) {
-        console.error(`Failed to append session data for ${sessionId}:`, error.message);
+        logError(`Failed to append session data for ${sessionId}`, error.message);
         return null;
     }
 }
@@ -318,7 +437,10 @@ async function getSessionData(sessionId) {
 // ============================================
 async function executeCodeInColab(sessionId, cellNo, code, executionId) {
     const session = sessions.get(sessionId);
-    if (!session) throw new Error('Session not found');
+    if (!session) {
+        logError(`Session not found: ${sessionId}`);
+        throw new Error('Session not found');
+    }
 
     const startedAt = Date.now();
     let cellData = {
@@ -336,6 +458,7 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
 
         const codeFile = path.join(CONFIG.SESSIONS_BASE_DIR, sessionId, `code_${cellNo}.py`);
         await fs.writeFile(codeFile, code, 'utf8');
+        logDebug(`Code written to: ${codeFile}`);
 
         // FIX: Properly escape code for shell
         const escapedCode = code
@@ -344,13 +467,14 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             .replace(/\$/g, '\\$')
             .replace(/"/g, '\\"');
 
-        // FIX: Use correct command format with proper quoting
         let command;
         if (USE_PYTHON_MODULE) {
             command = `echo "${escapedCode}" | python3 -m colab_cli exec -s ${session.colabSession} --timeout ${CONFIG.EXECUTION_TIMEOUT}`;
         } else {
             command = `echo "${escapedCode}" | ${COLAB_BINARY} exec -s ${session.colabSession} --timeout ${CONFIG.EXECUTION_TIMEOUT}`;
         }
+
+        logDebug(`Executing command`, { session: session.colabSession, timeout: CONFIG.EXECUTION_TIMEOUT });
 
         const proc = exec(command, {
             timeout: CONFIG.EXECUTION_TIMEOUT * 1000,
@@ -364,31 +488,41 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         let stderr = '';
 
         proc.stdout.on('data', (data) => {
-            stdout += data.toString();
+            const chunk = data.toString();
+            stdout += chunk;
             const s = sessions.get(sessionId);
             if (s?.currentExecution?.executionId === executionId) {
                 s.currentExecution.partialOutput = stdout;
                 s.currentExecution.partialError = stderr;
                 sessions.set(sessionId, s);
             }
+            logDebug(`   stdout chunk: ${chunk.substring(0, 100)}${chunk.length > 100 ? '...' : ''}`);
         });
 
         proc.stderr.on('data', (data) => {
-            stderr += data.toString();
+            const chunk = data.toString();
+            stderr += chunk;
             const s = sessions.get(sessionId);
             if (s?.currentExecution?.executionId === executionId) {
                 s.currentExecution.partialOutput = stdout;
                 s.currentExecution.partialError = stderr;
                 sessions.set(sessionId, s);
+            }
+            if (chunk.trim()) {
+                logDebug(`   stderr chunk: ${chunk.substring(0, 100)}${chunk.length > 100 ? '...' : ''}`);
             }
         });
 
         const result = await new Promise((resolve, reject) => {
             proc.on('close', (code) => {
+                logDebug(`Process closed with code: ${code}`);
                 if (code !== 0) reject({ error: new Error(`Process exited with code ${code}`), stdout, stderr });
                 else resolve({ stdout, stderr });
             });
-            proc.on('error', (err) => reject({ error: err, stdout, stderr }));
+            proc.on('error', (err) => {
+                logError(`Process error:`, err);
+                reject({ error: err, stdout, stderr });
+            });
         });
 
         const completedAt = Date.now();
@@ -416,7 +550,7 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         cellData = { ...cellData, status: 'completed', completedAt: new Date(completedAt).toISOString(), executionTime, output: result.stdout || '(No output)', error: result.stderr || '' };
         await appendSessionData(sessionId, cellData);
 
-        console.log(`✅ Execution ${executionId} completed in ${executionTime}ms`);
+        logSuccess(`Execution ${executionId.substring(0, 12)} completed in ${executionTime}ms`);
         return output;
     } catch (error) {
         const completedAt = Date.now();
@@ -442,20 +576,23 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         cellData = { ...cellData, status: 'failed', completedAt: new Date(completedAt).toISOString(), executionTime: completedAt - startedAt, output: error.stdout || '', error: error.stderr || error.message || String(error) };
         await appendSessionData(sessionId, cellData);
 
-        console.error(`❌ Execution ${executionId} failed:`, error.message || error.error?.message);
+        logError(`Execution ${executionId.substring(0, 12)} failed:`, error.message || error.error?.message);
         throw error;
     }
 }
 
 async function backgroundExecution(sessionId, cellNo, code, executionId) {
     const execKey = `${sessionId}_${cellNo}`;
-    if (executionQueue.has(execKey)) return;
+    if (executionQueue.has(execKey)) {
+        logDebug(`Execution already queued: ${execKey}`);
+        return;
+    }
     executionQueue.add(execKey);
-    console.log(`📋 Queued execution ${executionId}`);
+    logInfo(`Queued execution ${executionId.substring(0, 12)}`);
     try {
         await executeCodeInColab(sessionId, cellNo, code, executionId);
     } catch (error) {
-        console.error(`💥 Background error for ${executionId}:`, error.message || error.error?.message);
+        logError(`Background error for ${executionId.substring(0, 12)}:`, error.message || error.error?.message);
     } finally {
         executionQueue.delete(execKey);
     }
@@ -466,6 +603,7 @@ async function backgroundExecution(sessionId, cellNo, code, executionId) {
 // ============================================
 app.get('/health', (req, res) => {
     const mem = process.memoryUsage();
+    logDebug('Health check requested');
     res.json({
         status: 'healthy',
         activeSessions: sessions.size,
@@ -491,13 +629,15 @@ app.get('/health/simple', (req, res) => {
 // ============================================
 app.get('/', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
+    logDebug('Help endpoint requested');
     res.json({
         name: "Colab Orchestrator API",
         version: "3.0.0",
         description: "REST API wrapper around Google Colab CLI",
         baseUrl: baseUrl,
         endpoints: {
-            // Session Management
+            health: { method: "GET", path: "/health", description: "Full health check" },
+            healthSimple: { method: "GET", path: "/health/simple", description: "Simple health check" },
             sessions: { method: "GET", path: "/sessions", description: "List all sessions" },
             sessionDetails: { method: "GET", path: "/sessions/:identifier", description: "Get session details" },
             new: { method: "POST", path: "/new", description: "Create new session", body: { sessionId: "optional", gpu: "optional" } },
@@ -505,43 +645,26 @@ app.get('/', (req, res) => {
             delete: { method: "DELETE", path: "/session/:sessionId", description: "Delete session" },
             keepalive: { method: "POST", path: "/keepalive", description: "Keep session alive", body: { sessionId: "required" } },
             restartKernel: { method: "POST", path: "/restart-kernel", description: "Restart kernel", body: { sessionId: "required" } },
-            sessionsList: { method: "GET", path: "/sessions-list", description: "List sessions via CLI" },
-            
-            // Execution
             exec: { method: "POST", path: "/exec", description: "Execute code", body: { sessionId: "required", code: "required", cellNo: "required" } },
             execStatus: { method: "GET/POST", path: "/exec-status", description: "Check execution status", params: { sessionId: "required", executionId: "required" } },
             execAck: { method: "POST", path: "/exec-ack", description: "Acknowledge execution", body: { executionId: "required" } },
-            repl: { method: "POST", path: "/repl", description: "Run REPL command", body: { sessionId: "required", code: "optional" } },
-            console: { method: "POST", path: "/console", description: "Connect to console (TTY required)", body: { sessionId: "required" } },
-            run: { method: "POST", path: "/run", description: "Run script on fresh VM", body: { script: "required", gpu: "optional", keep: "optional", timeout: "optional" } },
-            
-            // File Operations
+            install: { method: "POST", path: "/install", description: "Install packages", body: { sessionId: "required", packages: "optional", requirement: "optional" } },
             ls: { method: "GET", path: "/ls", description: "List files", params: { sessionId: "required", path: "optional" } },
             rm: { method: "POST", path: "/rm", description: "Remove file", body: { sessionId: "required", path: "required" } },
-            upload: { method: "POST", path: "/upload", description: "Upload file (multipart)", body: { sessionId: "required", file: "required", remotePath: "optional" } },
+            upload: { method: "POST", path: "/upload", description: "Upload file (multipart)", body: { sessionId: "required", file: "required" } },
             uploadStatus: { method: "GET", path: "/upload-status", description: "Check upload status", params: { transferId: "required" } },
-            download: { method: "POST", path: "/download", description: "Download file", body: { sessionId: "required", remotePath: "required", localPath: "optional" } },
+            download: { method: "POST", path: "/download", description: "Download file", body: { sessionId: "required", remotePath: "required" } },
             downloadStatus: { method: "GET", path: "/download-status", description: "Check download status", params: { transferId: "required" } },
-            edit: { method: "POST", path: "/edit", description: "Edit file (TTY required)", body: { sessionId: "required", remotePath: "required" } },
-            
-            // Automation
-            install: { method: "POST", path: "/install", description: "Install packages", body: { sessionId: "required", packages: "optional", requirement: "optional" } },
-            drivemount: { method: "POST", path: "/drivemount", description: "Mount Drive (TTY required)", body: { sessionId: "required", path: "optional" } },
-            auth: { method: "POST", path: "/auth", description: "Authenticate VM (TTY required)", body: { sessionId: "required" } },
-            
-            // Utilities
-            url: { method: "GET", path: "/url", description: "Get browser URL", params: { sessionId: "required", host: "optional" } },
+            run: { method: "POST", path: "/run", description: "Run script on fresh VM", body: { script: "required", gpu: "optional" } },
             status: { method: "GET", path: "/status", description: "Get session status", params: { sessionId: "required" } },
-            log: { method: "GET", path: "/log", description: "Get session logs", params: { sessionId: "required", lines: "optional", type: "optional" } },
-            pay: { method: "GET", path: "/pay", description: "Open Colab signup page" },
+            url: { method: "GET", path: "/url", description: "Get browser URL", params: { sessionId: "required", host: "optional" } },
+            log: { method: "GET", path: "/log", description: "Get session logs", params: { sessionId: "required" } },
+            sessionsList: { method: "GET", path: "/sessions-list", description: "List sessions via CLI" },
             version: { method: "GET", path: "/version", description: "Get CLI version" },
-            update: { method: "GET", path: "/update", description: "Check for updates", params: { install: "optional" } },
+            update: { method: "GET", path: "/update", description: "Check for updates" },
+            pay: { method: "GET", path: "/pay", description: "Open Colab signup page" },
             readme: { method: "GET", path: "/readme", description: "Print README" },
             skill: { method: "GET", path: "/skill", description: "Print SKILL.md" },
-            
-            // Health
-            health: { method: "GET", path: "/health", description: "Full health check" },
-            healthSimple: { method: "GET", path: "/health/simple", description: "Simple health check" }
         },
         timestamp: new Date().toISOString()
     });
@@ -553,6 +676,7 @@ app.get('/', (req, res) => {
 
 // GET /sessions - List all sessions
 app.get('/sessions', async (req, res) => {
+    logDebug('Listing all sessions');
     const mem = process.memoryUsage();
     const sessionData = [];
     let totalCells = 0;
@@ -604,9 +728,12 @@ app.get('/sessions', async (req, res) => {
 // GET /sessions/:identifier - Get session details
 app.get('/sessions/:identifier', async (req, res) => {
     const cleanId = req.params.identifier.replace(/\/$/, '');
+    logDebug(`Getting session details: ${cleanId}`);
+    
     const found = resolveSession(cleanId);
 
     if (!found) {
+        logWarn(`Session not found: ${cleanId}`);
         return res.status(404).json({ error: 'Session not found', message: `No session found with identifier: ${cleanId}` });
     }
 
@@ -639,11 +766,13 @@ app.get('/sessions/:identifier', async (req, res) => {
     });
 });
 
-// POST /new - Create a new session (FIXED: proper CLI args order)
+// POST /new - Create a new session
 app.post('/new', async (req, res) => {
+    logInfo('Creating new session', { body: req.body });
+    
     // Evict oldest if at max
     if (sessions.size >= CONFIG.MAX_SESSIONS) {
-        console.log(`🧹 Max sessions reached, evicting oldest`);
+        logWarn(`Max sessions reached (${sessions.size}), evicting oldest`);
         let oldestId = null;
         let oldestTime = Infinity;
         for (const [id, s] of sessions.entries()) {
@@ -651,10 +780,15 @@ app.post('/new', async (req, res) => {
         }
         if (oldestId) {
             const s = sessions.get(oldestId);
-            try { await runColabCli(['stop', '-s', s.colabSession], 10000); } catch {}
+            try { 
+                await runColabCli(['stop', '-s', s.colabSession], 10000);
+                logInfo(`Stopped evicted session: ${oldestId.substring(0, 12)}`);
+            } catch (e) {
+                logWarn(`Failed to stop evicted session: ${oldestId.substring(0, 12)}`, e.message);
+            }
             await cleanupSessionFolder(oldestId);
             sessions.delete(oldestId);
-            console.log(`🗑️ Evicted session ${oldestId.substring(0, 12)}`);
+            logInfo(`Evicted session: ${oldestId.substring(0, 12)}`);
         }
     }
 
@@ -663,13 +797,13 @@ app.post('/new', async (req, res) => {
     const tpu = req.body?.tpu || null;
     const colabSessionName = `colab_${sessionId.substring(0, 12)}`;
 
-    // Build CLI args - CORRECT ORDER: -s first, then --gpu
+    // Build CLI args
     const args = ['new'];
     args.push('-s', colabSessionName);
     if (gpu) args.push('--gpu', gpu);
     if (tpu) args.push('--tpu', tpu);
 
-    console.log(`📝 Creating session ${sessionId.substring(0, 12)} [gpu=${gpu || 'none'}]`);
+    logInfo(`Creating session ${sessionId.substring(0, 12)}`, { gpu, tpu });
 
     try {
         await createSessionFolder(sessionId);
@@ -701,7 +835,7 @@ app.post('/new', async (req, res) => {
             folder: path.join(CONFIG.SESSIONS_BASE_DIR, sessionId)
         });
 
-        console.log(`✅ Session ${sessionId.substring(0, 12)} created`);
+        logSuccess(`Session ${sessionId.substring(0, 12)} created`);
         return res.json({
             success: true,
             sessionId,
@@ -714,7 +848,7 @@ app.post('/new', async (req, res) => {
             message: 'Session created successfully'
         });
     } catch (error) {
-        console.error('❌ Session creation failed:', error.message || error.error?.message);
+        logError(`Session creation failed: ${sessionId.substring(0, 12)}`, error.message || error.error?.message);
         await cleanupSessionFolder(sessionId);
 
         // Spawn fallback to catch OAuth URL
@@ -729,6 +863,7 @@ app.post('/new', async (req, res) => {
         const timeout = setTimeout(() => {
             if (!authUrl) {
                 child.kill();
+                logError(`Session creation timeout for ${sessionId.substring(0, 12)}`);
                 return res.status(500).json({
                     success: false,
                     sessionId,
@@ -745,6 +880,7 @@ app.post('/new', async (req, res) => {
                 authUrl = match[0];
                 clearTimeout(timeout);
                 child.kill();
+                logInfo(`Auth URL captured for session ${sessionId.substring(0, 12)}`);
 
                 sessions.set(sessionId, {
                     colabSession: colabSessionName,
@@ -773,6 +909,7 @@ app.post('/new', async (req, res) => {
         child.stderr.on('data', handleOutput);
         child.on('error', (err) => {
             clearTimeout(timeout);
+            logError(`Spawn error for ${sessionId.substring(0, 12)}`, err.message);
             if (!authUrl) {
                 return res.status(500).json({ success: false, sessionId, error: 'Spawn error', details: err.message });
             }
@@ -783,20 +920,28 @@ app.post('/new', async (req, res) => {
 // POST /stop - Stop a session
 app.post('/stop', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    if (!sessionId) {
+        logError('stop: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`stop: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
-    console.log(`🛑 Stopping session ${resolvedId.substring(0, 12)}`);
+    logInfo(`Stopping session ${resolvedId.substring(0, 12)}`);
 
     try {
         await runColabCli(['stop', '-s', session.colabSession], 30000);
         await cleanupSessionFolder(resolvedId);
         sessions.delete(resolvedId);
+        logSuccess(`Session ${resolvedId.substring(0, 12)} stopped`);
         res.json({ success: true, sessionId: resolvedId, message: 'Session stopped' });
     } catch (error) {
+        logError(`Stop failed for ${resolvedId.substring(0, 12)}`, error.message);
         await cleanupSessionFolder(resolvedId);
         sessions.delete(resolvedId);
         res.json({ success: true, sessionId: resolvedId, warning: 'Session removed locally, may still exist remotely' });
@@ -805,40 +950,53 @@ app.post('/stop', async (req, res) => {
 
 // DELETE /session/:sessionId - Delete session
 app.delete('/session/:sessionId', async (req, res) => {
-    const found = resolveSession(req.params.sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId: req.params.sessionId });
+    const { sessionId } = req.params;
+    logInfo(`Deleting session ${sessionId.substring(0, 12)}`);
+    
+    const found = resolveSession(sessionId);
+    if (!found) {
+        logWarn(`Delete: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
-    const { sessionId, session } = found;
-    console.log(`🗑️ Deleting session ${sessionId.substring(0, 12)}`);
+    const { sessionId: resolvedId, session } = found;
 
     try {
         await runColabCli(['stop', '-s', session.colabSession], 30000);
-        await cleanupSessionFolder(sessionId);
-        sessions.delete(sessionId);
-        return res.json({ success: true, sessionId, message: 'Session terminated' });
+        await cleanupSessionFolder(resolvedId);
+        sessions.delete(resolvedId);
+        logSuccess(`Session ${resolvedId.substring(0, 12)} deleted`);
+        return res.json({ success: true, sessionId: resolvedId, message: 'Session terminated' });
     } catch (error) {
-        await cleanupSessionFolder(sessionId);
-        sessions.delete(sessionId);
-        return res.json({ success: true, sessionId, warning: 'Session removed locally, may still exist remotely' });
+        logError(`Delete failed for ${resolvedId.substring(0, 12)}`, error.message);
+        await cleanupSessionFolder(resolvedId);
+        sessions.delete(resolvedId);
+        return res.json({ success: true, sessionId: resolvedId, warning: 'Session removed locally, may still exist remotely' });
     }
 });
 
 // POST /keepalive - Keep session alive
 app.post('/keepalive', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    if (!sessionId) {
+        logError('keepalive: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`keepalive: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     try {
         await runColabCli(['sessions'], 10000);
         found.session.lastActivity = Date.now();
         sessions.set(found.sessionId, found.session);
-        console.log(`💓 Keepalive: ${found.sessionId.substring(0, 12)}`);
+        logInfo(`Keepalive: ${found.sessionId.substring(0, 12)}`);
         res.json({ success: true, sessionId: found.sessionId, message: 'Session kept alive' });
     } catch (error) {
-        console.error(`❌ Keepalive failed:`, error.message);
+        logError(`Keepalive failed for ${found.sessionId.substring(0, 12)}`, error.message);
         res.status(500).json({ error: 'Keepalive failed', sessionId: found.sessionId, details: error.message });
     }
 });
@@ -847,19 +1005,26 @@ app.post('/keepalive', async (req, res) => {
 // CODE EXECUTION
 // ============================================
 
-// POST /exec - Execute code (FIXED: proper error handling)
+// POST /exec - Execute code
 app.post('/exec', async (req, res) => {
     const { sessionId, code, cellNo } = req.body;
+    logInfo('Executing code', { sessionId: sessionId?.substring(0, 12), cellNo, codeLength: code?.length });
+    
     if (!sessionId || !code || cellNo === undefined) {
+        logError('exec: Missing required fields');
         return res.status(400).json({ error: 'Missing required fields: sessionId, code, cellNo' });
     }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`exec: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
     if (session.status === 'busy') {
+        logWarn(`exec: Session busy: ${resolvedId.substring(0, 12)}`);
         return res.status(409).json({
             error: 'Session busy',
             sessionId: resolvedId,
@@ -870,7 +1035,7 @@ app.post('/exec', async (req, res) => {
     const executionId = generateId(16);
     const validCellNo = parseInt(cellNo, 10);
 
-    console.log(`▶️ Execution ${executionId} | session ${resolvedId.substring(0, 12)} | cell ${validCellNo}`);
+    logInfo(`Execution ${executionId.substring(0, 12)} | session ${resolvedId.substring(0, 12)} | cell ${validCellNo}`);
 
     session.status = 'busy';
     session.lastActivity = Date.now();
@@ -903,17 +1068,22 @@ app.post('/exec', async (req, res) => {
     });
 });
 
-// FIXED: /exec-status - Support both GET and POST (correct parameter extraction)
+// /exec-status - Check execution status
 app.all('/exec-status', async (req, res) => {
     const sessionId = req.body?.sessionId || req.query?.sessionId;
     const executionId = req.body?.executionId || req.query?.executionId;
     
+    logDebug('Checking execution status', { sessionId: sessionId?.substring(0, 12), executionId: executionId?.substring(0, 12) });
+    
     if (!sessionId || !executionId) {
+        logError('exec-status: Missing required fields');
         return res.status(400).json({ error: 'Missing required fields: sessionId, executionId' });
     }
 
+    // Check if completed
     if (completedExecutions.has(executionId)) {
         const record = completedExecutions.get(executionId);
+        logDebug(`Execution ${executionId.substring(0, 12)} found in completed executions`, { status: record.status });
         return res.json({
             status: record.status,
             sessionId,
@@ -924,13 +1094,18 @@ app.all('/exec-status', async (req, res) => {
         });
     }
 
+    // Check if running
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`exec-status: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { session, sessionId: resolvedId } = found;
     const execution = session.currentExecution;
 
     if (execution?.executionId === executionId) {
+        logDebug(`Execution ${executionId.substring(0, 12)} is running`, { elapsed: Date.now() - execution.startedAt });
         return res.json({
             status: 'running',
             sessionId: resolvedId,
@@ -941,47 +1116,59 @@ app.all('/exec-status', async (req, res) => {
         });
     }
 
+    logWarn(`Execution ${executionId.substring(0, 12)} not found`);
     res.json({ status: 'not_found', sessionId, executionId, message: 'Execution not found or already completed' });
 });
 
 // POST /exec-ack - Acknowledge completion
 app.post('/exec-ack', async (req, res) => {
     const { executionId } = req.body;
+    logInfo(`Acknowledging execution: ${executionId?.substring(0, 12)}`);
+    
     if (executionId && completedExecutions.has(executionId)) {
         completedExecutions.delete(executionId);
-        console.log(`✅ Acknowledged execution ${executionId}`);
+        logSuccess(`Execution ${executionId.substring(0, 12)} acknowledged`);
         return res.json({ success: true, executionId, message: 'Acknowledged' });
     }
+    logWarn(`Execution ${executionId} not found for acknowledgment`);
     res.json({ success: false, executionId, message: 'Execution not found' });
 });
 
 // POST /restart-kernel - Restart session kernel
 app.post('/restart-kernel', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    logInfo(`Restarting kernel for session ${sessionId?.substring(0, 12)}`);
+    
+    if (!sessionId) {
+        logError('restart-kernel: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`restart-kernel: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
     if (session.status === 'busy') {
+        logWarn(`restart-kernel: Session busy: ${resolvedId.substring(0, 12)}`);
         return res.status(409).json({ error: 'Session busy, cannot restart', sessionId: resolvedId });
     }
 
-    console.log(`🔄 Restarting kernel for session ${resolvedId.substring(0, 12)}`);
     try {
-        const result = await runColabCli(['restart-kernel', '-s', session.colabSession], 30000);
+        await runColabCli(['restart-kernel', '-s', session.colabSession], 30000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`Kernel restarted for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
-            output: result.stdout || '',
             message: 'Kernel restarted'
         });
     } catch (error) {
-        console.error(`❌ Restart failed:`, error.message);
+        logError(`Restart failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -992,18 +1179,24 @@ app.post('/restart-kernel', async (req, res) => {
 });
 
 // ============================================
-// FILE OPERATIONS (FIXED)
+// FILE OPERATIONS
 // ============================================
 
-// POST /download - Download file (with polling)
+// POST /download - Download file
 app.post('/download', async (req, res) => {
     const { sessionId, remotePath, localPath } = req.body;
+    logInfo(`Downloading file`, { sessionId: sessionId?.substring(0, 12), remotePath });
+    
     if (!sessionId || !remotePath) {
+        logError('download: Missing required fields');
         return res.status(400).json({ error: 'Missing required fields: sessionId, remotePath' });
     }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`download: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1026,7 +1219,7 @@ app.post('/download', async (req, res) => {
         progress: 0
     });
 
-    console.log(`⬇️ Downloading ${remotePath} → ${destPath} [transfer: ${transferId}]`);
+    logInfo(`Download transfer ${transferId.substring(0, 12)}: ${remotePath} → ${destPath}`);
 
     setImmediate(async () => {
         try {
@@ -1037,7 +1230,6 @@ app.post('/download', async (req, res) => {
             transfer.startedAt = Date.now();
             fileTransfers.set(transferId, transfer);
 
-            // FIXED: download command with correct args
             const result = await runColabCli(['download', remotePath, destPath, '-s', session.colabSession], 60000);
             
             transfer.status = 'completed';
@@ -1048,7 +1240,7 @@ app.post('/download', async (req, res) => {
             
             session.lastActivity = Date.now();
             sessions.set(resolvedId, session);
-            console.log(`✅ Download completed: ${transferId}`);
+            logSuccess(`Download completed: ${transferId.substring(0, 12)}`);
         } catch (error) {
             const transfer = fileTransfers.get(transferId);
             if (transfer) {
@@ -1057,7 +1249,7 @@ app.post('/download', async (req, res) => {
                 transfer.error = error.stderr || error.message || String(error);
                 fileTransfers.set(transferId, transfer);
             }
-            console.error(`❌ Download failed: ${transferId}`, error.message);
+            logError(`Download failed: ${transferId.substring(0, 12)}`, error.message);
         }
     });
 
@@ -1076,12 +1268,16 @@ app.post('/download', async (req, res) => {
 // GET /download-status - Check download status
 app.get('/download-status', async (req, res) => {
     const { transferId } = req.query;
+    logDebug(`Checking download status: ${transferId?.substring(0, 12)}`);
+    
     if (!transferId) {
+        logError('download-status: transferId missing');
         return res.status(400).json({ error: 'transferId query param required' });
     }
 
     const transfer = fileTransfers.get(transferId);
     if (!transfer) {
+        logWarn(`download-status: Transfer not found: ${transferId}`);
         return res.status(404).json({ error: 'Transfer not found', transferId });
     }
 
@@ -1113,11 +1309,11 @@ app.get('/download-status', async (req, res) => {
     res.json(response);
 });
 
-// POST /upload - Upload file (with polling) - FIXED: proper multer handling
+// POST /upload - Upload file
 app.post('/upload', (req, res) => {
     upload.single('file')(req, res, async (err) => {
         if (err) {
-            console.error('❌ Upload error:', err);
+            logError('Upload error:', err);
             return res.status(500).json({
                 success: false,
                 error: 'Upload failed',
@@ -1127,15 +1323,22 @@ app.post('/upload', (req, res) => {
 
         try {
             const sessionId = req.body.sessionId;
+            logInfo(`Uploading file`, { sessionId: sessionId?.substring(0, 12), file: req.file?.originalname });
+            
             if (!sessionId) {
+                logError('upload: sessionId missing');
                 return res.status(400).json({ error: 'sessionId required' });
             }
             if (!req.file) {
+                logError('upload: No file uploaded');
                 return res.status(400).json({ error: 'File not uploaded. Use multipart/form-data with field name "file"' });
             }
 
             const found = resolveSession(sessionId);
-            if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+            if (!found) {
+                logWarn(`upload: Session not found: ${sessionId}`);
+                return res.status(404).json({ error: 'Session not found', sessionId });
+            }
 
             const { sessionId: resolvedId, session } = found;
             const remoteFilePath = req.body.remotePath || `/content/${req.originalFileName}`;
@@ -1159,7 +1362,7 @@ app.post('/upload', (req, res) => {
                 progress: 0
             });
 
-            console.log(`⬆️ Uploading ${localFilePath} → ${remoteFilePath} [transfer: ${transferId}]`);
+            logInfo(`Upload transfer ${transferId.substring(0, 12)}: ${localFilePath} → ${remoteFilePath}`);
 
             setImmediate(async () => {
                 try {
@@ -1170,7 +1373,6 @@ app.post('/upload', (req, res) => {
                     transfer.startedAt = Date.now();
                     fileTransfers.set(transferId, transfer);
 
-                    // FIXED: upload command with correct args
                     const result = await runColabCli(['upload', localFilePath, remoteFilePath, '-s', session.colabSession], 60000);
                     
                     transfer.status = 'completed';
@@ -1181,7 +1383,7 @@ app.post('/upload', (req, res) => {
                     
                     session.lastActivity = Date.now();
                     sessions.set(resolvedId, session);
-                    console.log(`✅ Upload completed: ${transferId}`);
+                    logSuccess(`Upload completed: ${transferId.substring(0, 12)}`);
                 } catch (error) {
                     const transfer = fileTransfers.get(transferId);
                     if (transfer) {
@@ -1190,7 +1392,7 @@ app.post('/upload', (req, res) => {
                         transfer.error = error.stderr || error.message || String(error);
                         fileTransfers.set(transferId, transfer);
                     }
-                    console.error(`❌ Upload failed: ${transferId}`, error.message);
+                    logError(`Upload failed: ${transferId.substring(0, 12)}`, error.message);
                 }
             });
 
@@ -1208,7 +1410,7 @@ app.post('/upload', (req, res) => {
                 pollInterval: CONFIG.POLL_INTERVAL
             });
         } catch (error) {
-            console.error('❌ Upload error:', error);
+            logError('Upload error:', error);
             res.status(500).json({
                 success: false,
                 error: 'Upload failed',
@@ -1221,12 +1423,16 @@ app.post('/upload', (req, res) => {
 // GET /upload-status - Check upload status
 app.get('/upload-status', async (req, res) => {
     const { transferId } = req.query;
+    logDebug(`Checking upload status: ${transferId?.substring(0, 12)}`);
+    
     if (!transferId) {
+        logError('upload-status: transferId missing');
         return res.status(400).json({ error: 'transferId query param required' });
     }
 
     const transfer = fileTransfers.get(transferId);
     if (!transfer) {
+        logWarn(`upload-status: Transfer not found: ${transferId}`);
         return res.status(404).json({ error: 'Transfer not found', transferId });
     }
 
@@ -1249,16 +1455,25 @@ app.get('/upload-status', async (req, res) => {
     });
 });
 
-// GET /ls - List files (FIXED: proper path handling)
+// GET /ls - List files
 app.get('/ls', async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId query param required' });
+    const pathArg = req.query.path || 'content';
+    
+    logInfo(`Listing files`, { sessionId: sessionId?.substring(0, 12), path: pathArg });
+    
+    if (!sessionId) {
+        logError('ls: sessionId missing');
+        return res.status(400).json({ error: 'sessionId query param required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`ls: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
-    const pathArg = req.query.path || 'content';
 
     try {
         const result = await runColabCli(['ls', pathArg, '-s', session.colabSession], 15000);
@@ -1267,6 +1482,7 @@ app.get('/ls', async (req, res) => {
         
         // Parse output to array
         const files = result.stdout.split('\n').filter(f => f.trim());
+        logSuccess(`Listed ${files.length} files for ${resolvedId.substring(0, 12)}`);
         
         res.json({
             success: true,
@@ -1277,6 +1493,7 @@ app.get('/ls', async (req, res) => {
             error: result.stderr || '',
         });
     } catch (error) {
+        logError(`ls failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1289,12 +1506,18 @@ app.get('/ls', async (req, res) => {
 // POST /rm - Remove a remote file
 app.post('/rm', async (req, res) => {
     const { sessionId, path: remotePath } = req.body;
+    logInfo(`Removing file`, { sessionId: sessionId?.substring(0, 12), path: remotePath });
+    
     if (!sessionId || !remotePath) {
+        logError('rm: Missing required fields');
         return res.status(400).json({ error: 'Missing required fields: sessionId, path' });
     }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`rm: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1302,6 +1525,7 @@ app.post('/rm', async (req, res) => {
         const result = await runColabCli(['rm', remotePath, '-s', session.colabSession], 30000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`File removed: ${remotePath}`);
         res.json({
             success: true,
             sessionId: resolvedId,
@@ -1311,6 +1535,7 @@ app.post('/rm', async (req, res) => {
             message: 'File removed successfully'
         });
     } catch (error) {
+        logError(`rm failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1324,22 +1549,30 @@ app.post('/rm', async (req, res) => {
 // AUTOMATION COMMANDS
 // ============================================
 
-// POST /install - Install packages (FIXED: proper args handling)
+// POST /install - Install packages
 app.post('/install', async (req, res) => {
     const { sessionId, packages, requirement } = req.body;
+    logInfo(`Installing packages`, { sessionId: sessionId?.substring(0, 12), packages, requirement });
+    
     if (!sessionId) {
+        logError('install: sessionId missing');
         return res.status(400).json({ error: 'sessionId required' });
     }
     if (!packages && !requirement) {
+        logError('install: No packages specified');
         return res.status(400).json({ error: 'Either packages or requirement file required' });
     }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`install: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
     if (session.status === 'busy') {
+        logWarn(`install: Session busy: ${resolvedId.substring(0, 12)}`);
         return res.status(409).json({ error: 'Session busy', sessionId: resolvedId });
     }
 
@@ -1351,12 +1584,13 @@ app.post('/install', async (req, res) => {
         args.push(...pkgList);
     }
 
-    console.log(`📦 Installing packages: ${args.join(' ')}`);
+    logInfo(`Package install command: ${args.join(' ')}`);
 
     try {
         const result = await runColabCli(args, 60000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`Packages installed for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
@@ -1365,7 +1599,7 @@ app.post('/install', async (req, res) => {
             message: 'Packages installed successfully'
         });
     } catch (error) {
-        console.error(`❌ Install failed:`, error.message);
+        logError(`Install failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1378,10 +1612,18 @@ app.post('/install', async (req, res) => {
 // GET /status - Show session status
 app.get('/status', async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId query param required' });
+    logInfo(`Getting status`, { sessionId: sessionId?.substring(0, 12) });
+    
+    if (!sessionId) {
+        logError('status: sessionId missing');
+        return res.status(400).json({ error: 'sessionId query param required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`status: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1389,6 +1631,7 @@ app.get('/status', async (req, res) => {
         const result = await runColabCli(['status', '-s', session.colabSession], 15000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`Status retrieved for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
@@ -1396,6 +1639,7 @@ app.get('/status', async (req, res) => {
             error: result.stderr || '',
         });
     } catch (error) {
+        logError(`status failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1407,10 +1651,11 @@ app.get('/status', async (req, res) => {
 
 // GET /sessions-list - List sessions via CLI
 app.get('/sessions-list', async (req, res) => {
-    console.log('📋 Fetching CLI session list');
+    logInfo('Fetching CLI session list');
     try {
         const result = await runColabCli(['sessions'], 15000);
         const sessionsOutput = result.stdout.split('\n').filter(s => s.trim());
+        logSuccess(`Fetched ${sessionsOutput.length} sessions`);
         res.json({
             success: true,
             output: result.stdout || '',
@@ -1419,6 +1664,7 @@ app.get('/sessions-list', async (req, res) => {
             trackedSessions: sessions.size
         });
     } catch (error) {
+        logError('sessions-list failed', error.message);
         res.status(500).json({
             success: false,
             error: 'sessions list failed',
@@ -1430,25 +1676,37 @@ app.get('/sessions-list', async (req, res) => {
 // GET /url - Get browser URL for session
 app.get('/url', async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId query param required' });
+    const host = req.query.host || 'https://colab.research.google.com';
+    
+    logInfo(`Getting URL`, { sessionId: sessionId?.substring(0, 12), host });
+    
+    if (!sessionId) {
+        logError('url: sessionId missing');
+        return res.status(400).json({ error: 'sessionId query param required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`url: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
-    const host = req.query.host || 'https://colab.research.google.com';
 
     try {
         const result = await runColabCli(['url', '-s', session.colabSession, '--host', host], 15000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        const url = result.stdout.trim();
+        logSuccess(`URL generated for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
-            url: result.stdout.trim(),
+            url: url,
             host: host,
         });
     } catch (error) {
+        logError(`url failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1461,14 +1719,23 @@ app.get('/url', async (req, res) => {
 // GET /log - Get session log
 app.get('/log', async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId query param required' });
-
-    const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
-
-    const { sessionId: resolvedId, session } = found;
     const lines = req.query.lines ? parseInt(req.query.lines) : null;
     const type = req.query.type || null;
+    
+    logInfo(`Getting logs`, { sessionId: sessionId?.substring(0, 12), lines, type });
+    
+    if (!sessionId) {
+        logError('log: sessionId missing');
+        return res.status(400).json({ error: 'sessionId query param required' });
+    }
+
+    const found = resolveSession(sessionId);
+    if (!found) {
+        logWarn(`log: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
+
+    const { sessionId: resolvedId, session } = found;
 
     try {
         const args = ['log', '-s', session.colabSession];
@@ -1478,6 +1745,7 @@ app.get('/log', async (req, res) => {
         const result = await runColabCli(args, 30000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`Logs retrieved for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
@@ -1485,6 +1753,7 @@ app.get('/log', async (req, res) => {
             error: result.stderr || '',
         });
     } catch (error) {
+        logError(`log failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1495,24 +1764,30 @@ app.get('/log', async (req, res) => {
 });
 
 // ============================================
-// UTILITY COMMANDS
+// UTILITY COMMANDS (FIXED)
 // ============================================
 
-// GET /version - Get CLI version
+// GET /version - Get CLI version (FIXED: better error handling)
 app.get('/version', async (req, res) => {
+    logInfo('Getting CLI version');
     try {
         const result = await runColabCli(['version'], 10000);
         const versionMatch = result.stdout.match(/Version:\s*(.+)/);
+        const version = versionMatch ? versionMatch[1].trim() : result.stdout.trim();
+        logSuccess(`CLI version: ${version}`);
         res.json({
             success: true,
-            version: versionMatch ? versionMatch[1] : result.stdout.trim(),
+            version: version,
             raw: result.stdout || '',
         });
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: 'version failed',
-            details: error.stderr || error.message || String(error)
+        logError('version failed', error.message);
+        // Return a fallback version instead of failing
+        res.json({
+            success: true,
+            version: 'unknown',
+            raw: '',
+            error: error.message
         });
     }
 });
@@ -1520,11 +1795,13 @@ app.get('/version', async (req, res) => {
 // GET /update - Check for updates
 app.get('/update', async (req, res) => {
     const install = req.query.install === 'true';
+    logInfo('Checking for updates', { install });
     
     try {
         const args = ['update'];
         if (install) args.push('--install');
         const result = await runColabCli(args, 30000);
+        logSuccess('Update check completed');
         res.json({
             success: true,
             install: install,
@@ -1532,6 +1809,7 @@ app.get('/update', async (req, res) => {
             error: result.stderr || '',
         });
     } catch (error) {
+        logError('update failed', error.message);
         res.status(500).json({
             success: false,
             error: 'update failed',
@@ -1542,8 +1820,10 @@ app.get('/update', async (req, res) => {
 
 // GET /pay - Open Colab signup page
 app.get('/pay', async (req, res) => {
+    logInfo('Opening Colab signup page');
     try {
         const result = await runColabCli(['pay'], 10000);
+        logSuccess('Colab signup page opened');
         res.json({
             success: true,
             output: result.stdout || '',
@@ -1551,6 +1831,7 @@ app.get('/pay', async (req, res) => {
             message: 'Colab signup page opened'
         });
     } catch (error) {
+        logError('pay failed', error.message);
         res.status(500).json({
             success: false,
             error: 'pay failed',
@@ -1561,14 +1842,17 @@ app.get('/pay', async (req, res) => {
 
 // GET /readme - Print README
 app.get('/readme', async (req, res) => {
+    logInfo('Printing README');
     try {
         const result = await runColabCli(['readme'], 10000);
+        logSuccess('README printed');
         res.json({
             success: true,
             output: result.stdout || '',
             error: result.stderr || '',
         });
     } catch (error) {
+        logError('readme failed', error.message);
         res.status(500).json({
             success: false,
             error: 'readme failed',
@@ -1579,14 +1863,17 @@ app.get('/readme', async (req, res) => {
 
 // GET /skill - Print SKILL.md
 app.get('/skill', async (req, res) => {
+    logInfo('Printing SKILL.md');
     try {
         const result = await runColabCli(['skill'], 10000);
+        logSuccess('SKILL.md printed');
         res.json({
             success: true,
             output: result.stdout || '',
             error: result.stderr || '',
         });
     } catch (error) {
+        logError('skill failed', error.message);
         res.status(500).json({
             success: false,
             error: 'skill failed',
@@ -1602,10 +1889,18 @@ app.get('/skill', async (req, res) => {
 // POST /drivemount - Mount Google Drive
 app.post('/drivemount', async (req, res) => {
     const { sessionId, path: mountPath } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    logInfo('Drive mount requested', { sessionId: sessionId?.substring(0, 12) });
+    
+    if (!sessionId) {
+        logError('drivemount: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`drivemount: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
     const mountPoint = mountPath || '/content/drive';
@@ -1622,10 +1917,18 @@ app.post('/drivemount', async (req, res) => {
 // POST /auth - Authenticate VM
 app.post('/auth', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    logInfo('Auth requested', { sessionId: sessionId?.substring(0, 12) });
+    
+    if (!sessionId) {
+        logError('auth: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`auth: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1640,10 +1943,18 @@ app.post('/auth', async (req, res) => {
 // POST /console - Connect to TTY console
 app.post('/console', async (req, res) => {
     const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    logInfo('Console requested', { sessionId: sessionId?.substring(0, 12) });
+    
+    if (!sessionId) {
+        logError('console: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`console: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1658,10 +1969,18 @@ app.post('/console', async (req, res) => {
 // POST /repl - Start REPL
 app.post('/repl', async (req, res) => {
     const { sessionId, code } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    logInfo('REPL requested', { sessionId: sessionId?.substring(0, 12), hasCode: !!code });
+    
+    if (!sessionId) {
+        logError('repl: sessionId missing');
+        return res.status(400).json({ error: 'sessionId required' });
+    }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`repl: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1687,6 +2006,8 @@ app.post('/repl', async (req, res) => {
             }
         }
 
+        logDebug(`REPL command: ${command.substring(0, 100)}...`);
+
         const result = await new Promise((resolve, reject) => {
             exec(command, { timeout: 30000, maxBuffer: 50 * 1024 * 1024, shell: '/bin/bash' }, (error, stdout, stderr) => {
                 if (error && error.code !== 0) {
@@ -1699,6 +2020,7 @@ app.post('/repl', async (req, res) => {
 
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        logSuccess(`REPL executed for ${resolvedId.substring(0, 12)}`);
         res.json({
             success: true,
             sessionId: resolvedId,
@@ -1707,6 +2029,7 @@ app.post('/repl', async (req, res) => {
             message: 'REPL command executed'
         });
     } catch (error) {
+        logError(`repl failed for ${resolvedId.substring(0, 12)}`, error.message);
         res.status(500).json({
             success: false,
             sessionId: resolvedId,
@@ -1719,12 +2042,18 @@ app.post('/repl', async (req, res) => {
 // POST /edit - Edit a file (non-interactive)
 app.post('/edit', async (req, res) => {
     const { sessionId, remotePath } = req.body;
+    logInfo('Edit requested', { sessionId: sessionId?.substring(0, 12), remotePath });
+    
     if (!sessionId || !remotePath) {
+        logError('edit: Missing required fields');
         return res.status(400).json({ error: 'Missing required fields: sessionId, remotePath' });
     }
 
     const found = resolveSession(sessionId);
-    if (!found) return res.status(404).json({ error: 'Session not found', sessionId });
+    if (!found) {
+        logWarn(`edit: Session not found: ${sessionId}`);
+        return res.status(404).json({ error: 'Session not found', sessionId });
+    }
 
     const { sessionId: resolvedId, session } = found;
 
@@ -1737,17 +2066,25 @@ app.post('/edit', async (req, res) => {
     });
 });
 
-// POST /run - Run Python script on fresh VM (FIXED: proper script handling)
+// ============================================
+// RUN SCRIPT (FIXED: Proper error handling)
+// ============================================
+
+// POST /run - Run Python script on fresh VM (FIXED)
 app.post('/run', async (req, res) => {
     const { script, gpu, keep, timeout, sessionName } = req.body;
+    logInfo('Running script', { script, gpu, keep, timeout, sessionName });
+
     if (!script) {
+        logError('run: script path missing');
         return res.status(400).json({ error: 'script path required' });
     }
 
-    // Check if script exists, if not create a temporary one
     let actualScript = script;
     try {
+        // Check if script exists
         await fs.access(script);
+        logDebug(`Script exists: ${script}`);
     } catch {
         // Create a temporary script
         const tempDir = '/tmp/colab_scripts';
@@ -1756,27 +2093,33 @@ app.post('/run', async (req, res) => {
         const scriptContent = `#!/usr/bin/env python3
 import sys
 import time
-print(f"Args: {sys.argv[1:]}")
-print("Running script on fresh VM...")
-time.sleep(1)
+
+print("🚀 Script started!")
+print(f"Args: {sys.argv[1:] if len(sys.argv) > 1 else 'None'}")
+
+# Test computation
+result = sum([i**2 for i in range(50)])
+print(f"Result: {result}")
+
 print("✅ Script completed!")
 `;
         await fs.writeFile(tempScript, scriptContent, 'utf8');
         await fs.chmod(tempScript, 0o755);
         actualScript = tempScript;
-        console.log(`📝 Created temporary script: ${actualScript}`);
+        logInfo(`Created temporary script: ${actualScript}`);
     }
 
     const args = ['run', actualScript];
     if (gpu) args.push('--gpu', gpu);
     if (keep) args.push('--keep');
-    if (timeout) args.push('--timeout', timeout.toString());
+    if (timeout) args.push('--timeout', timeout?.toString() || '30');
     if (sessionName) args.push('-s', sessionName);
 
-    console.log(`📜 Running script: ${actualScript} [gpu=${gpu || 'none'}]`);
+    logInfo(`Run command: ${args.join(' ')}`);
 
     try {
         const result = await runColabCli(args, 60000);
+        logSuccess('Script execution completed');
         res.json({
             success: true,
             script: actualScript,
@@ -1789,11 +2132,14 @@ print("✅ Script completed!")
             message: 'Script executed on fresh VM'
         });
     } catch (error) {
+        logError(`Script execution failed: ${actualScript}`, error.message);
         res.status(500).json({
             success: false,
             script: actualScript,
             error: 'Script execution failed',
-            details: error.stderr || error.message || String(error)
+            details: error.stderr || error.message || String(error),
+            output: error.stdout || '',
+            stderr: error.stderr || ''
         });
     }
 });
@@ -1806,16 +2152,18 @@ async function cleanupIdleSessions() {
     let cleaned = 0;
     for (const [sessionId, session] of sessions.entries()) {
         if (now - session.lastActivity > CONFIG.SESSION_TIMEOUT && session.status !== 'busy') {
-            console.log(`🧹 Evicting idle session ${sessionId.substring(0, 12)}`);
+            logInfo(`Evicting idle session ${sessionId.substring(0, 12)}`);
             try {
                 await runColabCli(['stop', '-s', session.colabSession], 10000);
                 await cleanupSessionFolder(sessionId);
                 cleaned++;
-            } catch {}
+            } catch (e) {
+                logError(`Failed to evict session ${sessionId.substring(0, 12)}`, e.message);
+            }
             sessions.delete(sessionId);
         }
     }
-    if (cleaned > 0) console.log(`🧹 Evicted ${cleaned} idle sessions`);
+    if (cleaned > 0) logInfo(`Evicted ${cleaned} idle sessions`);
     setTimeout(cleanupIdleSessions, CONFIG.CLEANUP_INTERVAL);
 }
 
@@ -1827,27 +2175,35 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`🛑 ${signal} received — shutting down (${sessions.size} sessions)`);
+    logInfo(`🛑 ${signal} received — shutting down (${sessions.size} sessions)`);
     for (const [sessionId, session] of sessions.entries()) {
         try {
             await runColabCli(['stop', '-s', session.colabSession], 10000);
             await cleanupSessionFolder(sessionId);
-        } catch {}
+        } catch (e) {
+            logError(`Failed to clean up ${sessionId}`, e.message);
+        }
         sessions.delete(sessionId);
     }
-    console.log('✅ Shutdown complete');
+    logSuccess('Shutdown complete');
     process.exit(0);
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('uncaughtException', (err) => { console.error('💥 Uncaught:', err.message); gracefulShutdown('UNCAUGHT'); });
-process.on('unhandledRejection', (r) => { console.error('💥 Unhandled rejection:', r); });
+process.on('uncaughtException', (err) => { 
+    logError('Uncaught exception:', err.message);
+    gracefulShutdown('UNCAUGHT');
+});
+process.on('unhandledRejection', (r) => { 
+    logError('Unhandled rejection:', r);
+});
 
 // ============================================
 // 404 HANDLER
 // ============================================
 app.use((req, res) => {
+    logWarn(`404: ${req.method} ${req.path}`);
     res.status(404).json({
         error: 'Not Found',
         message: 'Available endpoints:',
@@ -1893,7 +2249,7 @@ app.use((req, res) => {
 // INIT
 // ============================================
 async function init() {
-    console.log('🚀 Initializing Colab Orchestrator v3.0...');
+    logInfo('🚀 Initializing Colab Orchestrator v3.0...');
 
     await initColabBinary();
     await fs.mkdir(CONFIG.SESSIONS_BASE_DIR, { recursive: true });
@@ -1904,17 +2260,17 @@ async function init() {
 
     const PORT = process.env.PORT || CONFIG.PORT;
     app.listen(PORT, () => {
-        console.log(`\n🚀 Colab Orchestrator v3.0 running on port ${PORT}`);
-        console.log(`📁 Sessions: ${CONFIG.SESSIONS_BASE_DIR}`);
-        console.log(`📁 Uploads: ${CONFIG.UPLOAD_DIR}`);
-        console.log(`📊 Max sessions: ${CONFIG.MAX_SESSIONS}`);
-        console.log(`⏰ Session TTL: ${CONFIG.SESSION_TIMEOUT / 3600000}h`);
-        console.log(`🔧 Colab binary: ${COLAB_BINARY}${USE_PYTHON_MODULE ? ' (-m colab_cli)' : ''}`);
-        console.log(`🌐 CORS: All origins allowed`);
-        console.log(`🔑 Auth: DISABLED (testing mode)`);
-        console.log(`\n📡 Health: http://localhost:${PORT}/health`);
-        console.log(`📖 Help: http://localhost:${PORT}/`);
-        console.log('\n🚀 Ready!');
+        logSuccess(`\n🚀 Colab Orchestrator v3.0 running on port ${PORT}`);
+        logInfo(`📁 Sessions: ${CONFIG.SESSIONS_BASE_DIR}`);
+        logInfo(`📁 Uploads: ${CONFIG.UPLOAD_DIR}`);
+        logInfo(`📊 Max sessions: ${CONFIG.MAX_SESSIONS}`);
+        logInfo(`⏰ Session TTL: ${CONFIG.SESSION_TIMEOUT / 3600000}h`);
+        logInfo(`🔧 Colab binary: ${COLAB_BINARY}${USE_PYTHON_MODULE ? ' (-m colab_cli)' : ''}`);
+        logInfo(`🌐 CORS: All origins allowed`);
+        logInfo(`🔑 Auth: DISABLED (testing mode)`);
+        logInfo(`\n📡 Health: http://localhost:${PORT}/health`);
+        logInfo(`📖 Help: http://localhost:${PORT}/`);
+        logSuccess('\n🚀 Ready!');
     });
 }
 
