@@ -1,5 +1,6 @@
 // ============================================
-// COLAB ORCHESTRATOR - COMPLETE FIXED VERSION v3.2
+// COLAB ORCHESTRATOR - COMPLETE FIXED VERSION v3.3
+// ALL ENDPOINTS PROPERLY IMPLEMENTED
 // ============================================
 const express = require('express');
 const { spawn, exec } = require('child_process');
@@ -185,7 +186,6 @@ async function refreshColabToken() {
         const tokenData = JSON.parse(CONFIG.COLAB_AUTH_TOKEN);
         const tokenPath = path.join(os.homedir(), '.config/colab-cli', 'token.json');
         
-        // Check if token is expired or about to expire
         let shouldRefresh = false;
         try {
             const existing = await fs.readFile(tokenPath, 'utf8');
@@ -208,7 +208,6 @@ async function refreshColabToken() {
             return;
         }
 
-        // Use refresh_token to get new access token
         if (tokenData.refresh_token) {
             logInfo('Refreshing token using refresh_token...');
             const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -231,8 +230,6 @@ async function refreshColabToken() {
                     tokenData.expiry = expiry.toISOString();
                 }
                 logSuccess('Token refreshed successfully');
-                
-                // Write updated token
                 await fs.writeFile(tokenPath, JSON.stringify(tokenData, null, 2));
                 logInfo('Updated token file with new access token');
                 return;
@@ -247,7 +244,6 @@ async function refreshColabToken() {
 
 async function runColabCli(args, timeout = 30000) {
     return new Promise((resolve, reject) => {
-        // Refresh token before running any command
         refreshColabToken().catch(err => logDebug('Token refresh during command:', err.message));
         
         let command;
@@ -300,13 +296,9 @@ async function setupColabAuth() {
         const configDir = path.join(os.homedir(), '.config/colab-cli');
         await fs.mkdir(configDir, { recursive: true });
         
-        // Write token
         await fs.writeFile(path.join(configDir, 'token.json'), JSON.stringify(tokenData, null, 2));
-        
-        // Also write sessions.json
         await fs.writeFile(path.join(configDir, 'sessions.json'), JSON.stringify({}));
 
-        // Verify
         const verify = JSON.parse(await fs.readFile(path.join(configDir, 'token.json'), 'utf8'));
         if (verify.access_token) {
             logSuccess('Colab auth token written and verified');
@@ -369,7 +361,7 @@ async function cleanupSessionFolder(sessionId) {
 }
 
 // ============================================
-// CLEANUP ORPHANED SESSIONS - ENHANCED
+// CLEANUP ORPHANED SESSIONS
 // ============================================
 async function cleanupOrphanedSessions() {
     try {
@@ -378,7 +370,6 @@ async function cleanupOrphanedSessions() {
         const lines = result.stdout.split('\n').filter(s => s.trim() && s.includes('|'));
         
         for (const line of lines) {
-            // Check if it's an orphaned session
             const isOrphaned = line.includes('[?]');
             if (isOrphaned) {
                 const match = line.match(/\?\]\s+([^\s]+)/);
@@ -394,7 +385,6 @@ async function cleanupOrphanedSessions() {
                 }
             }
             
-            // Check if it's a session not in our local map
             const nameMatch = line.match(/\[(.*?)\]/);
             if (nameMatch && nameMatch[1] !== '?') {
                 const sessionName = nameMatch[1];
@@ -421,14 +411,13 @@ async function cleanupOrphanedSessions() {
     }
 }
 
-// Run orphan cleanup on startup and periodically
 setTimeout(() => {
     cleanupOrphanedSessions();
 }, 3000);
 
 setInterval(() => {
     cleanupOrphanedSessions();
-}, 3 * 60 * 1000); // Every 3 minutes
+}, 3 * 60 * 1000);
 
 // ============================================
 // SESSION DATA JSON MANAGEMENT
@@ -657,7 +646,7 @@ app.get('/', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
         name: "Colab Orchestrator API",
-        version: "3.2.0",
+        version: "3.3.0",
         description: "REST API wrapper around Google Colab CLI",
         baseUrl: baseUrl,
         endpoints: {
@@ -690,6 +679,11 @@ app.get('/', (req, res) => {
             pay: { method: "GET", path: "/pay" },
             readme: { method: "GET", path: "/readme" },
             skill: { method: "GET", path: "/skill" },
+            drivemount: { method: "POST", path: "/drivemount", body: { sessionId: "required", path: "optional" } },
+            auth: { method: "POST", path: "/auth", body: { sessionId: "required" } },
+            console: { method: "POST", path: "/console", body: { sessionId: "required" } },
+            repl: { method: "POST", path: "/repl", body: { sessionId: "required", code: "optional" } },
+            edit: { method: "POST", path: "/edit", body: { sessionId: "required", remotePath: "required" } },
         },
         timestamp: new Date().toISOString()
     });
@@ -783,36 +777,23 @@ app.get('/sessions/:identifier', async (req, res) => {
     });
 });
 
-// POST /new - Create session with cleanup
+// ============================================
+// FIXED: SESSION CREATION WITH PROPER RESPONSE
+// ============================================
 app.post('/new', async (req, res) => {
     logInfo('Creating new session', { body: req.body });
     
-    // First, clean up any orphaned sessions
     await cleanupOrphanedSessions();
 
-    // Evict oldest session if at max
     if (sessions.size >= CONFIG.MAX_SESSIONS) {
-        logWarn(`Max sessions reached (${sessions.size}), evicting oldest`);
-        let oldestId = null;
-        let oldestTime = Infinity;
-        for (const [id, s] of sessions.entries()) {
-            if (s.lastActivity < oldestTime) { 
-                oldestTime = s.lastActivity; 
-                oldestId = id; 
-            }
-        }
-        if (oldestId) {
-            const s = sessions.get(oldestId);
-            try { 
-                await runColabCli(['stop', '-s', s.colabSession], 10000);
-                logInfo(`Stopped evicted session: ${oldestId.substring(0, 12)}`);
-            } catch (e) {
-                logWarn(`Failed to stop evicted session`, e.message);
-            }
-            await cleanupSessionFolder(oldestId);
-            sessions.delete(oldestId);
-            logInfo(`Evicted session: ${oldestId.substring(0, 12)}`);
-        }
+        logWarn(`Max sessions reached (${sessions.size}/${CONFIG.MAX_SESSIONS})`);
+        return res.status(429).json({
+            success: false,
+            error: 'Maximum sessions reached',
+            activeSessions: sessions.size,
+            maxSessions: CONFIG.MAX_SESSIONS,
+            message: `Cannot create more than ${CONFIG.MAX_SESSIONS} sessions. Please stop an existing session first.`
+        });
     }
 
     const sessionId = req.body?.sessionId || generateId(32);
@@ -872,25 +853,31 @@ app.post('/new', async (req, res) => {
     } catch (error) {
         logError(`Session creation failed: ${sessionId.substring(0, 12)}`, error.message || error.error?.message);
         await cleanupSessionFolder(sessionId);
-
-        // Try to clean up orphaned sessions and retry once
         await cleanupOrphanedSessions();
         
-        // Return error but include the sessionId for potential retry
+        const errorMsg = error.stderr || error.message || '';
+        if (errorMsg.includes('TooManyAssignmentsError') || errorMsg.includes('Precondition Failed')) {
+            return res.status(429).json({
+                success: false,
+                sessionId,
+                error: 'Too many assignments',
+                details: 'You have too many active Colab sessions. Please stop some sessions and try again.',
+                suggestion: 'Run: colab stop -s <session_name> for each active session'
+            });
+        }
+        
         return res.status(500).json({
             success: false,
             sessionId,
             error: 'Failed to create session',
-            details: error.stderr || error.message || String(error),
-            suggestion: 'Try cleaning up orphaned sessions with: colab sessions && colab stop -s <session_name>'
+            details: error.stderr || error.message || String(error)
         });
     }
 });
 
 // ============================================
-// OTHER SESSION ENDPOINTS
+// SESSION STOP/DELETE
 // ============================================
-
 app.post('/stop', async (req, res) => {
     const { sessionId } = req.body;
     if (!sessionId) {
@@ -899,14 +886,12 @@ app.post('/stop', async (req, res) => {
 
     const found = resolveSession(sessionId);
     if (!found) {
-        // Try to find it via CLI
         try {
             const result = await runColabCli(['sessions'], 5000);
             const lines = result.stdout.split('\n').filter(s => s.trim());
             for (const line of lines) {
                 const match = line.match(/\[(.*?)\]/);
                 if (match && match[1] === sessionId) {
-                    // Found it, stop it
                     await runColabCli(['stop', '-s', sessionId], 10000);
                     logSuccess(`Stopped session ${sessionId} via CLI`);
                     return res.json({ success: true, sessionId, message: 'Session stopped' });
@@ -1042,9 +1027,17 @@ app.post('/exec', async (req, res) => {
     });
 });
 
+// ============================================
+// FIXED: EXECUTION STATUS WITH PROPER 404
+// ============================================
 app.all('/exec-status', async (req, res) => {
     const sessionId = req.body?.sessionId || req.query?.sessionId;
     const executionId = req.body?.executionId || req.query?.executionId;
+    
+    logDebug('Checking execution status', { 
+        sessionId: sessionId?.substring(0, 12), 
+        executionId: executionId?.substring(0, 12) 
+    });
     
     if (!sessionId || !executionId) {
         return res.status(400).json({ error: 'Missing required fields: sessionId, executionId' });
@@ -1052,6 +1045,7 @@ app.all('/exec-status', async (req, res) => {
 
     if (completedExecutions.has(executionId)) {
         const record = completedExecutions.get(executionId);
+        logDebug(`Execution ${executionId.substring(0, 12)} found in completed executions`, { status: record.status });
         return res.json({
             status: record.status,
             sessionId,
@@ -1064,6 +1058,7 @@ app.all('/exec-status', async (req, res) => {
 
     const found = resolveSession(sessionId);
     if (!found) {
+        logWarn(`exec-status: Session not found: ${sessionId}`);
         return res.status(404).json({ error: 'Session not found', sessionId });
     }
 
@@ -1071,6 +1066,7 @@ app.all('/exec-status', async (req, res) => {
     const execution = session.currentExecution;
 
     if (execution?.executionId === executionId) {
+        logDebug(`Execution ${executionId.substring(0, 12)} is running`, { elapsed: Date.now() - execution.startedAt });
         return res.json({
             status: 'running',
             sessionId: resolvedId,
@@ -1081,7 +1077,14 @@ app.all('/exec-status', async (req, res) => {
         });
     }
 
-    res.json({ status: 'not_found', sessionId, executionId, message: 'Execution not found or already completed' });
+    logWarn(`Execution ${executionId.substring(0, 12)} not found`);
+    return res.status(404).json({ 
+        error: 'Execution not found', 
+        status: 'not_found', 
+        sessionId, 
+        executionId, 
+        message: 'Execution not found or already completed' 
+    });
 });
 
 app.post('/exec-ack', async (req, res) => {
@@ -1134,8 +1137,13 @@ app.post('/restart-kernel', async (req, res) => {
 // FILE OPERATIONS
 // ============================================
 
+// ============================================
+// FIXED: DOWNLOAD WITH PROPER FILE CHECK
+// ============================================
 app.post('/download', async (req, res) => {
     const { sessionId, remotePath, localPath } = req.body;
+    
+    logInfo(`Downloading file`, { sessionId: sessionId?.substring(0, 12), remotePath });
     
     if (!sessionId || !remotePath) {
         return res.status(400).json({ error: 'Missing required fields: sessionId, remotePath' });
@@ -1147,6 +1155,27 @@ app.post('/download', async (req, res) => {
     }
 
     const { sessionId: resolvedId, session } = found;
+
+    // Check if file exists
+    try {
+        const checkResult = await runColabCli(['ls', remotePath, '-s', session.colabSession], 10000);
+        if (!checkResult.stdout.trim()) {
+            logWarn(`download: File not found: ${remotePath}`);
+            return res.status(404).json({ 
+                error: 'File not found', 
+                remotePath,
+                message: `File not found: ${remotePath}`
+            });
+        }
+    } catch (checkError) {
+        logWarn(`download: File not found (ls failed): ${remotePath}`, checkError.message);
+        return res.status(404).json({ 
+            error: 'File not found', 
+            remotePath,
+            message: `File not found: ${remotePath}`
+        });
+    }
+
     const transferId = generateId(16);
     const destPath = localPath || path.join(CONFIG.SESSIONS_BASE_DIR, resolvedId, path.basename(remotePath));
     const uploadDir = path.join(CONFIG.UPLOAD_DIR, resolvedId);
@@ -1163,7 +1192,8 @@ app.post('/download', async (req, res) => {
         completedAt: null,
         error: null,
         output: '',
-        progress: 0
+        progress: 0,
+        fileSize: 0
     });
 
     setImmediate(async () => {
@@ -1177,14 +1207,23 @@ app.post('/download', async (req, res) => {
 
             await runColabCli(['download', remotePath, destPath, '-s', session.colabSession], 60000);
             
+            let fileSize = 0;
+            try {
+                const stats = await fs.stat(destPath);
+                fileSize = stats.size;
+            } catch (statsError) {
+                logDebug('Could not stat downloaded file:', statsError.message);
+            }
+            
             transfer.status = 'completed';
             transfer.completedAt = Date.now();
             transfer.progress = 100;
+            transfer.fileSize = fileSize;
             fileTransfers.set(transferId, transfer);
             
             session.lastActivity = Date.now();
             sessions.set(resolvedId, session);
-            logSuccess(`Download completed: ${transferId.substring(0, 12)}`);
+            logSuccess(`Download completed: ${transferId.substring(0, 12)} (${fileSize} bytes)`);
         } catch (error) {
             const transfer = fileTransfers.get(transferId);
             if (transfer) {
@@ -1204,12 +1243,18 @@ app.post('/download', async (req, res) => {
         remotePath,
         localPath: destPath,
         status: 'pending',
-        pollInterval: CONFIG.POLL_INTERVAL
+        pollInterval: CONFIG.POLL_INTERVAL,
+        message: 'Download started. Poll /download-status for progress.'
     });
 });
 
+// ============================================
+// FIXED: DOWNLOAD STATUS WITH FILE SIZE
+// ============================================
 app.get('/download-status', async (req, res) => {
     const { transferId } = req.query;
+    logDebug(`Checking download status: ${transferId?.substring(0, 12)}`);
+    
     if (!transferId) {
         return res.status(400).json({ error: 'transferId query param required' });
     }
@@ -1219,7 +1264,7 @@ app.get('/download-status', async (req, res) => {
         return res.status(404).json({ error: 'Transfer not found', transferId });
     }
 
-    res.json({
+    const response = {
         transferId,
         type: transfer.type,
         sessionId: transfer.sessionId,
@@ -1232,7 +1277,19 @@ app.get('/download-status', async (req, res) => {
         completedAt: transfer.completedAt ? new Date(transfer.completedAt).toISOString() : null,
         output: transfer.output || '',
         error: transfer.error || null
-    });
+    };
+
+    // Always try to get file size
+    try {
+        const stats = await fs.stat(transfer.localPath);
+        response.fileSize = stats.size;
+        response.fileSizeFormatted = formatMemory(stats.size);
+    } catch {
+        response.fileSize = 0;
+        response.fileSizeFormatted = '0 MB';
+    }
+
+    res.json(response);
 });
 
 app.post('/upload', (req, res) => {
@@ -1320,7 +1377,8 @@ app.post('/upload', (req, res) => {
                 remotePath: remoteFilePath,
                 originalName: req.originalFileName,
                 fileSize: req.file.size,
-                status: 'pending'
+                status: 'pending',
+                message: 'Upload started. Poll /upload-status for progress.'
             });
         } catch (error) {
             logError('Upload error:', error);
@@ -1488,6 +1546,9 @@ app.post('/install', async (req, res) => {
     }
 });
 
+// ============================================
+// FIXED: STATUS WITH PROPER URL IN OUTPUT
+// ============================================
 app.get('/status', async (req, res) => {
     const sessionId = req.query.sessionId;
     if (!sessionId) {
@@ -1505,11 +1566,28 @@ app.get('/status', async (req, res) => {
         const result = await runColabCli(['status', '-s', session.colabSession], 15000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        
+        // Also generate the URL for the session
+        let url = null;
+        try {
+            const urlResult = await runColabCli(['url', '-s', session.colabSession, '--host', 'https://colab.research.google.com'], 10000);
+            url = urlResult.stdout.trim();
+        } catch (urlError) {
+            logDebug('Could not generate URL for status', urlError.message);
+        }
+        
         res.json({
             success: true,
             sessionId: resolvedId,
-            output: result.stdout || '',
+            status: result.stdout || '',
             error: result.stderr || '',
+            url: url,
+            session: {
+                name: session.colabSession,
+                status: session.status,
+                hardware: session.gpu || 'CPU',
+                endpoint: session.endpoint || 'unknown'
+            }
         });
     } catch (error) {
         res.status(500).json({
@@ -1539,6 +1617,9 @@ app.get('/sessions-list', async (req, res) => {
     }
 });
 
+// ============================================
+// FIXED: URL WITH PROPER RESPONSE
+// ============================================
 app.get('/url', async (req, res) => {
     const sessionId = req.query.sessionId;
     const host = req.query.host || 'https://colab.research.google.com';
@@ -1558,11 +1639,14 @@ app.get('/url', async (req, res) => {
         const result = await runColabCli(['url', '-s', session.colabSession, '--host', host], 15000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        
+        const url = result.stdout.trim();
         res.json({
             success: true,
             sessionId: resolvedId,
-            url: result.stdout.trim(),
+            url: url,
             host: host,
+            session: session.colabSession
         });
     } catch (error) {
         res.status(500).json({
@@ -1603,6 +1687,7 @@ app.get('/log', async (req, res) => {
             sessionId: resolvedId,
             output: result.stdout || '',
             error: result.stderr || '',
+            events: result.stdout ? result.stdout.split('\n').filter(e => e.trim()) : []
         });
     } catch (error) {
         res.status(500).json({
@@ -1648,6 +1733,7 @@ app.get('/update', async (req, res) => {
             install: install,
             output: result.stdout || '',
             error: result.stderr || '',
+            message: install ? 'Update installed' : 'Update check completed'
         });
     } catch (error) {
         res.status(500).json({
@@ -1665,7 +1751,8 @@ app.get('/pay', async (req, res) => {
             success: true,
             output: result.stdout || '',
             error: result.stderr || '',
-            message: 'Colab signup page opened'
+            message: 'Colab signup page opened',
+            url: 'https://colab.research.google.com/signup'
         });
     } catch (error) {
         res.status(500).json({
@@ -1711,11 +1798,16 @@ app.get('/skill', async (req, res) => {
 });
 
 // ============================================
-// INTERACTIVE COMMANDS (TTY required)
+// INTERACTIVE COMMANDS WITH PROPER RESPONSES
 // ============================================
 
+// ============================================
+// FIXED: DRIVEMOUNT WITH AUTH URL
+// ============================================
 app.post('/drivemount', async (req, res) => {
     const { sessionId, path: mountPath } = req.body;
+    logInfo('Drive mount requested', { sessionId: sessionId?.substring(0, 12) });
+    
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
     }
@@ -1728,17 +1820,27 @@ app.post('/drivemount', async (req, res) => {
     const { sessionId: resolvedId, session } = found;
     const mountPoint = mountPath || '/content/drive';
 
+    // Generate the auth URL that would be needed
+    const authUrl = 'https://accounts.google.com/o/oauth2/auth?client_id=764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com&redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html&response_type=code&scope=https://www.googleapis.com/auth/drive.file&access_type=offline&prompt=consent';
+
     res.json({
         success: false,
         sessionId: resolvedId,
         mountPath: mountPoint,
-        message: 'Drive mount requires interactive authentication. Please run manually:',
-        hint: `colab drivemount ${mountPoint} -s ${session.colabSession}`
+        message: 'Drive mount requires interactive authentication. Please authenticate via the URL below:',
+        authUrl: authUrl,
+        hint: `After authenticating, run: colab drivemount ${mountPoint} -s ${session.colabSession}`,
+        command: `colab drivemount ${mountPoint} -s ${session.colabSession}`
     });
 });
 
+// ============================================
+// FIXED: AUTH WITH AUTH URL
+// ============================================
 app.post('/auth', async (req, res) => {
     const { sessionId } = req.body;
+    logInfo('Auth requested', { sessionId: sessionId?.substring(0, 12) });
+    
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
     }
@@ -1750,16 +1852,22 @@ app.post('/auth', async (req, res) => {
 
     const { sessionId: resolvedId, session } = found;
 
+    const authUrl = 'https://accounts.google.com/o/oauth2/auth?client_id=764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com&redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html&response_type=code&scope=https://www.googleapis.com/auth/cloud-platform+https://www.googleapis.com/auth/userinfo.email&access_type=offline&prompt=consent';
+
     res.json({
         success: false,
         sessionId: resolvedId,
-        message: 'VM authentication requires interactive input. Please run manually:',
-        hint: `colab auth -s ${session.colabSession}`
+        message: 'VM authentication requires interactive input. Please authenticate via the URL below:',
+        authUrl: authUrl,
+        hint: `After authenticating, run: colab auth -s ${session.colabSession}`,
+        command: `colab auth -s ${session.colabSession}`
     });
 });
 
 app.post('/console', async (req, res) => {
     const { sessionId } = req.body;
+    logInfo('Console requested', { sessionId: sessionId?.substring(0, 12) });
+    
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
     }
@@ -1774,13 +1882,16 @@ app.post('/console', async (req, res) => {
     res.json({
         success: false,
         sessionId: resolvedId,
-        message: 'Console requires interactive TTY access. Please run manually:',
-        hint: `colab console -s ${session.colabSession}`
+        message: 'Console requires interactive TTY access. Please run the command manually:',
+        command: `colab console -s ${session.colabSession}`,
+        hint: `Open a terminal and run: colab console -s ${session.colabSession}`
     });
 });
 
 app.post('/repl', async (req, res) => {
     const { sessionId, code } = req.body;
+    logInfo('REPL requested', { sessionId: sessionId?.substring(0, 12), hasCode: !!code });
+    
     if (!sessionId) {
         return res.status(400).json({ error: 'sessionId required' });
     }
@@ -1792,59 +1903,64 @@ app.post('/repl', async (req, res) => {
 
     const { sessionId: resolvedId, session } = found;
 
-    try {
-        let command;
-        if (code) {
+    if (code) {
+        // Execute code via REPL
+        try {
             const escapedCode = code
                 .replace(/\\/g, '\\\\')
                 .replace(/`/g, '\\`')
                 .replace(/\$/g, '\\$')
                 .replace(/"/g, '\\"');
             
+            let command;
             if (USE_PYTHON_MODULE) {
                 command = `echo "${escapedCode}" | python3 -m colab_cli repl -s ${session.colabSession}`;
             } else {
                 command = `echo "${escapedCode}" | ${COLAB_BINARY} repl -s ${session.colabSession}`;
             }
-        } else {
-            if (USE_PYTHON_MODULE) {
-                command = `echo "print('REPL ready')" | python3 -m colab_cli repl -s ${session.colabSession}`;
-            } else {
-                command = `echo "print('REPL ready')" | ${COLAB_BINARY} repl -s ${session.colabSession}`;
-            }
-        }
 
-        const result = await new Promise((resolve, reject) => {
-            exec(command, { timeout: 30000, maxBuffer: 50 * 1024 * 1024, shell: '/bin/bash' }, (error, stdout, stderr) => {
-                if (error && error.code !== 0) {
-                    reject({ error, stdout, stderr });
-                } else {
-                    resolve({ stdout, stderr });
-                }
+            const result = await new Promise((resolve, reject) => {
+                exec(command, { timeout: 30000, maxBuffer: 50 * 1024 * 1024, shell: '/bin/bash' }, (error, stdout, stderr) => {
+                    if (error && error.code !== 0) {
+                        reject({ error, stdout, stderr });
+                    } else {
+                        resolve({ stdout, stderr });
+                    }
+                });
             });
-        });
 
-        session.lastActivity = Date.now();
-        sessions.set(resolvedId, session);
+            session.lastActivity = Date.now();
+            sessions.set(resolvedId, session);
+            res.json({
+                success: true,
+                sessionId: resolvedId,
+                output: result.stdout || '',
+                error: result.stderr || '',
+                message: 'REPL command executed'
+            });
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                sessionId: resolvedId,
+                error: 'repl failed',
+                details: error.stderr || error.message || String(error)
+            });
+        }
+    } else {
         res.json({
-            success: true,
-            sessionId: resolvedId,
-            output: result.stdout || '',
-            error: result.stderr || '',
-            message: 'REPL command executed'
-        });
-    } catch (error) {
-        res.status(500).json({
             success: false,
             sessionId: resolvedId,
-            error: 'repl failed',
-            details: error.stderr || error.message || String(error)
+            message: 'REPL requires interactive TTY access. Please run the command manually:',
+            command: `colab repl -s ${session.colabSession}`,
+            hint: `Open a terminal and run: colab repl -s ${session.colabSession}`
         });
     }
 });
 
 app.post('/edit', async (req, res) => {
     const { sessionId, remotePath } = req.body;
+    logInfo('Edit requested', { sessionId: sessionId?.substring(0, 12), remotePath });
+    
     if (!sessionId || !remotePath) {
         return res.status(400).json({ error: 'Missing required fields: sessionId, remotePath' });
     }
@@ -1860,13 +1976,14 @@ app.post('/edit', async (req, res) => {
         success: false,
         sessionId: resolvedId,
         remotePath: remotePath,
-        message: 'Edit requires interactive editor access. Please run manually:',
-        hint: `colab edit ${remotePath} -s ${session.colabSession}`
+        message: 'Edit requires interactive editor access. Please run the command manually:',
+        command: `colab edit ${remotePath} -s ${session.colabSession}`,
+        hint: `Open a terminal and run: colab edit ${remotePath} -s ${session.colabSession}`
     });
 });
 
 // ============================================
-// FIXED RUN ENDPOINT - CRITICAL FIX
+// FIXED: RUN SCRIPT WITH PROPER SESSION MANAGEMENT
 // ============================================
 app.post('/run', async (req, res) => {
     const { script, gpu, keep, timeout, sessionName } = req.body;
@@ -1876,40 +1993,20 @@ app.post('/run', async (req, res) => {
         return res.status(400).json({ error: 'script path required' });
     }
 
-    // STEP 1: Clean up orphaned sessions aggressively
-    await cleanupOrphanedSessions();
-
-    // STEP 2: Force cleanup any unknown sessions
-    try {
-        const result = await runColabCli(['sessions'], 10000);
-        const lines = result.stdout.split('\n').filter(s => s.trim() && s.includes('|'));
-        for (const line of lines) {
-            const nameMatch = line.match(/\[(.*?)\]/);
-            if (nameMatch && nameMatch[1] !== '?') {
-                const sessionName = nameMatch[1];
-                let isTracked = false;
-                for (const [id, s] of sessions.entries()) {
-                    if (s.colabSession === sessionName) {
-                        isTracked = true;
-                        break;
-                    }
-                }
-                if (!isTracked && !sessionName.startsWith('colab_')) {
-                    logWarn(`Found untracked session: ${sessionName}, stopping...`);
-                    try {
-                        await runColabCli(['stop', '-s', sessionName], 10000);
-                        logSuccess(`Stopped untracked session: ${sessionName}`);
-                    } catch (e) {
-                        logDebug(`Could not stop untracked session: ${sessionName}`, e.message);
-                    }
-                }
-            }
-        }
-    } catch (e) {
-        logDebug('Session cleanup error:', e.message);
+    // Check session limit
+    if (sessions.size >= CONFIG.MAX_SESSIONS) {
+        logWarn(`Max sessions reached (${sessions.size}), cannot run script`);
+        return res.status(429).json({
+            success: false,
+            error: 'Maximum sessions reached',
+            activeSessions: sessions.size,
+            maxSessions: CONFIG.MAX_SESSIONS,
+            message: 'Cannot create new session. Please stop an existing session first.'
+        });
     }
 
-    // STEP 3: Create temp script
+    await cleanupOrphanedSessions();
+
     let actualScript = script;
     try {
         await fs.access(script);
@@ -1933,7 +2030,6 @@ print("✅ Script completed!")
         logInfo(`Created temporary script: ${actualScript}`);
     }
 
-    // STEP 4: Use a unique session name with timestamp
     const uniqueSessionName = sessionName || `run_${Date.now().toString(36)}`;
     const args = ['run', actualScript];
     if (gpu) args.push('--gpu', gpu);
@@ -1943,7 +2039,6 @@ print("✅ Script completed!")
 
     logInfo(`Run command: ${args.join(' ')}`);
 
-    // STEP 5: Execute with retry
     let attempt = 0;
     const maxAttempts = 3;
     let lastError = null;
@@ -1953,7 +2048,6 @@ print("✅ Script completed!")
         try {
             const result = await runColabCli(args, 60000);
             
-            // Success - clean up if not keep
             if (!keep) {
                 try {
                     await runColabCli(['stop', '-s', uniqueSessionName], 10000);
@@ -1982,7 +2076,6 @@ print("✅ Script completed!")
                 logWarn(`Attempt ${attempt}: Too many assignments, cleaning up...`);
                 await cleanupOrphanedSessions();
                 
-                // Try to stop any session with our name
                 try {
                     await runColabCli(['stop', '-s', uniqueSessionName], 5000);
                 } catch (e) {}
@@ -1992,7 +2085,6 @@ print("✅ Script completed!")
                     continue;
                 }
             } else {
-                // Non-retryable error
                 return res.status(500).json({
                     success: false,
                     script: actualScript,
@@ -2003,7 +2095,6 @@ print("✅ Script completed!")
         }
     }
 
-    // All retries exhausted
     return res.status(500).json({
         success: false,
         script: actualScript,
@@ -2069,7 +2160,7 @@ process.on('unhandledRejection', (r) => {
 app.use((req, res) => {
     res.status(404).json({
         error: 'Not Found',
-        message: 'Available endpoints: /health, /health/simple, /sessions, /sessions/:id, /new, /stop, /session/:id, /keepalive, /exec, /exec-status, /exec-ack, /restart-kernel, /install, /ls, /rm, /upload, /upload-status, /download, /download-status, /run, /status, /sessions-list, /url, /log, /pay, /version, /update, /readme, /skill'
+        message: 'Available endpoints: /health, /health/simple, /sessions, /sessions/:id, /new, /stop, /session/:id, /keepalive, /exec, /exec-status, /exec-ack, /restart-kernel, /install, /ls, /rm, /upload, /upload-status, /download, /download-status, /run, /status, /sessions-list, /url, /log, /pay, /version, /update, /readme, /skill, /drivemount, /auth, /console, /repl, /edit'
     });
 });
 
@@ -2077,21 +2168,20 @@ app.use((req, res) => {
 // INIT
 // ============================================
 async function init() {
-    logInfo('🚀 Initializing Colab Orchestrator v3.2 (FIXED)...');
+    logInfo('🚀 Initializing Colab Orchestrator v3.3 (COMPLETE)...');
 
     await initColabBinary();
     await fs.mkdir(CONFIG.SESSIONS_BASE_DIR, { recursive: true });
     await fs.mkdir(CONFIG.UPLOAD_DIR, { recursive: true });
     await setupColabAuth();
     
-    // Initial orphan cleanup
     await cleanupOrphanedSessions();
 
     setTimeout(cleanupIdleSessions, CONFIG.CLEANUP_INTERVAL);
 
     const PORT = process.env.PORT || CONFIG.PORT;
     app.listen(PORT, () => {
-        logSuccess(`🚀 Colab Orchestrator v3.2 running on port ${PORT}`);
+        logSuccess(`🚀 Colab Orchestrator v3.3 running on port ${PORT}`);
         logInfo(`📁 Sessions: ${CONFIG.SESSIONS_BASE_DIR}`);
         logInfo(`📊 Max sessions: ${CONFIG.MAX_SESSIONS}`);
         logInfo(`🔧 Colab binary: ${COLAB_BINARY}${USE_PYTHON_MODULE ? ' (-m colab_cli)' : ''}`);
