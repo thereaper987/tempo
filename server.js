@@ -1,7 +1,6 @@
 // ============================================
-// COLAB ORCHESTRATOR - v3.7 (EVICTION & STATELESS RUN)
-// FIXED: Oldest session eviction, Stateless /run
-// ALL ENDPOINTS PROPERLY IMPLEMENTED
+// COLAB ORCHESTRATOR - v3.8 (TOKEN CACHING & ALL FIXES)
+// COMPLETE FILE - ALL ENDPOINTS IMPLEMENTED
 // ============================================
 const express = require('express');
 const { spawn, exec } = require('child_process');
@@ -35,6 +34,17 @@ const CONFIG = {
     HANGING_PROCESS_CLEANUP_INTERVAL: 900000,
     COMPLETED_EXECUTIONS_TTL: 1200000,
 };
+
+// ============================================
+// STATE MANAGEMENT
+// ============================================
+const sessions = new Map();
+const completedExecutions = new Map();
+const executionQueue = new Set();
+const activeProcesses = new Map(); // SessionId -> Set of ChildProcesses
+const fileTransfers = new Map();
+let cachedToken = null;
+let tokenExpiry = null;
 
 // ============================================
 // ENHANCED LOGGING
@@ -121,8 +131,9 @@ function formatMemory(bytes) {
 }
 
 function resolveSession(identifier) {
+    if (!identifier) return null;
     for (const [id, s] of sessions.entries()) {
-        if (id === identifier || id.substring(0, 8) === identifier) {
+        if (id === identifier || id.substring(0, 8) === identifier || s.colabSession === identifier) {
             return { sessionId: id, session: s };
         }
     }
@@ -169,15 +180,6 @@ const upload = multer({
 });
 
 // ============================================
-// STATE MANAGEMENT
-// ============================================
-const sessions = new Map(); // Insertion order is preserved in JS Maps
-const completedExecutions = new Map();
-const executionQueue = new Set();
-const activeProcesses = new Map(); // SessionId -> Set of ChildProcesses
-const fileTransfers = new Map();
-
-// ============================================
 // COLAB BINARY SETUP
 // ============================================
 let COLAB_BINARY = 'colab';
@@ -203,35 +205,41 @@ async function initColabBinary() {
 }
 
 // ============================================
-// COLAB CLI RUNNER
+// COLAB CLI RUNNER WITH TOKEN CACHING
 // ============================================
 async function refreshColabToken() {
+    // Only refresh if token is expired or about to expire
+    const now = Date.now();
+    
+    // Check if we have a valid cached token
+    if (cachedToken && tokenExpiry && now < tokenExpiry - 300000) { // 5 min buffer
+        logDebug('Using cached token (valid until ' + new Date(tokenExpiry).toISOString() + ')');
+        return;
+    }
+
     try {
         const tokenData = JSON.parse(CONFIG.COLAB_AUTH_TOKEN);
         const tokenPath = path.join(os.homedir(), '.config/colab-cli', 'token.json');
         
-        let shouldRefresh = false;
+        // Read existing token to check expiry
         try {
             const existing = await fs.readFile(tokenPath, 'utf8');
             const parsed = JSON.parse(existing);
             if (parsed.expiry) {
                 const expiry = new Date(parsed.expiry);
-                const now = new Date();
-                const fiveMinutes = 5 * 60 * 1000;
-                if (now >= new Date(expiry.getTime() - fiveMinutes)) {
-                    shouldRefresh = true;
-                    logInfo('Token is near expiry, refreshing...');
+                if (now < expiry.getTime() - 300000) {
+                    // Token is still valid
+                    cachedToken = parsed.access_token || parsed.token;
+                    tokenExpiry = expiry.getTime();
+                    logDebug('Token from file is still valid');
+                    return;
                 }
             }
-        } catch {
-            shouldRefresh = true;
+        } catch (e) {
+            // File doesn't exist or can't be read
         }
 
-        if (!shouldRefresh && tokenData.access_token) {
-            logDebug('Token is still valid, skipping refresh');
-            return;
-        }
-
+        // Need to refresh
         if (tokenData.refresh_token) {
             logInfo('Refreshing token using refresh_token...');
             const response = await fetch('https://oauth2.googleapis.com/token', {
@@ -252,6 +260,8 @@ async function refreshColabToken() {
                     const expiry = new Date();
                     expiry.setSeconds(expiry.getSeconds() + data.expires_in);
                     tokenData.expiry = expiry.toISOString();
+                    tokenExpiry = expiry.getTime();
+                    cachedToken = data.access_token;
                 }
                 logSuccess('Token refreshed successfully');
                 await fs.writeFile(tokenPath, JSON.stringify(tokenData, null, 2));
@@ -261,12 +271,21 @@ async function refreshColabToken() {
                 logError('Token refresh failed:', data);
             }
         }
+        
+        // Fallback: use existing token from CONFIG
+        if (tokenData.access_token) {
+            cachedToken = tokenData.access_token;
+            if (tokenData.expiry) {
+                tokenExpiry = new Date(tokenData.expiry).getTime();
+            }
+        }
     } catch (error) {
         logError('Token refresh error:', error.message);
     }
 }
 
 async function runColabCli(args, sessionId = null, inputData = null, timeoutMs = 60000) {
+    // Only refresh token if needed (cached check inside function)
     await refreshColabToken().catch(() => {});
     
     return new Promise((resolve, reject) => {
@@ -333,6 +352,12 @@ async function setupColabAuth() {
         
         await fs.writeFile(path.join(configDir, 'token.json'), JSON.stringify(tokenData, null, 2));
         await fs.writeFile(path.join(configDir, 'sessions.json'), JSON.stringify({}));
+
+        // Cache initial token
+        cachedToken = tokenData.access_token || tokenData.token;
+        if (tokenData.expiry) {
+            tokenExpiry = new Date(tokenData.expiry).getTime();
+        }
 
         const verify = JSON.parse(await fs.readFile(path.join(configDir, 'token.json'), 'utf8'));
         if (verify.access_token) {
@@ -559,7 +584,49 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         await fs.writeFile(codeFile, code, 'utf8');
 
         const args = ['exec', '-s', session.colabSession, '--timeout', CONFIG.EXECUTION_TIMEOUT.toString()];
-        const result = await runColabCli(args, sessionId, code, CONFIG.EXECUTION_TIMEOUT * 1000);
+        
+        // Use spawn directly to capture streaming output
+        const spawnArgs = USE_PYTHON_MODULE ? ['-m', 'colab_cli', ...args] : args;
+        const child = spawn(COLAB_BINARY, spawnArgs, { shell: false });
+        
+        let stdout = '';
+        let stderr = '';
+        
+        child.stdin.write(code);
+        child.stdin.end();
+        
+        child.stdout.on('data', (data) => {
+            const chunk = data.toString();
+            stdout += chunk;
+            // Update partial output in real-time
+            const currentSession = sessions.get(sessionId);
+            if (currentSession?.currentExecution?.executionId === executionId) {
+                currentSession.currentExecution.partialOutput = stdout;
+                currentSession.currentExecution.partialError = stderr;
+                sessions.set(sessionId, currentSession);
+            }
+        });
+        
+        child.stderr.on('data', (data) => {
+            const chunk = data.toString();
+            stderr += chunk;
+            const currentSession = sessions.get(sessionId);
+            if (currentSession?.currentExecution?.executionId === executionId) {
+                currentSession.currentExecution.partialOutput = stdout;
+                currentSession.currentExecution.partialError = stderr;
+                sessions.set(sessionId, currentSession);
+            }
+        });
+        
+        const result = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Timeout')); }, CONFIG.EXECUTION_TIMEOUT * 1000);
+            child.on('close', (code) => {
+                clearTimeout(timer);
+                if (code !== 0) reject({ error: new Error(`Exit ${code}`), stdout, stderr });
+                else resolve({ stdout, stderr });
+            });
+            child.on('error', (err) => reject({ error: err, stdout, stderr }));
+        });
 
         const completedAt = Date.now();
         const executionTime = completedAt - startedAt;
@@ -663,7 +730,7 @@ app.get('/', (req, res) => {
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     res.json({
         name: "Colab Orchestrator API",
-        version: "3.7.0",
+        version: "3.8.0",
         description: "REST API wrapper around Google Colab CLI",
         baseUrl: baseUrl,
         endpoints: {
@@ -1275,6 +1342,9 @@ app.get('/download-status', async (req, res) => {
     res.json(response);
 });
 
+// ============================================
+// RETRIEVE FILE - FIXED
+// ============================================
 app.get('/retrieve-file', async (req, res) => {
     const { sessionId, filename } = req.query;
     
@@ -1290,7 +1360,7 @@ app.get('/retrieve-file', async (req, res) => {
     const baseSessionDir = path.join(CONFIG.SESSIONS_BASE_DIR, path.basename(sessionId));
     const baseUploadDir = path.join(CONFIG.UPLOAD_DIR, path.basename(sessionId));
     
-    // Check multiple locations for the file
+    // Check multiple locations
     const locations = [
         path.join(baseSessionDir, safeFilename),
         path.join(baseSessionDir, filename),
@@ -1301,8 +1371,10 @@ app.get('/retrieve-file', async (req, res) => {
     for (const loc of locations) {
         try {
             await fs.access(loc);
-            logInfo(`Retrieving file: ${loc}`);
-            return res.download(loc, filename);
+            // Set proper Content-Disposition header
+            res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+            res.setHeader('Content-Type', 'application/octet-stream');
+            return res.download(loc, safeFilename);
         } catch (e) {
             // Continue to next location
         }
@@ -1480,6 +1552,9 @@ app.get('/ls', async (req, res) => {
     }
 });
 
+// ============================================
+// RM - FIXED: Handle files that don't exist gracefully
+// ============================================
 app.post('/rm', async (req, res) => {
     const { sessionId, path: remotePath } = req.body;
     
@@ -1505,12 +1580,23 @@ app.post('/rm', async (req, res) => {
             message: 'File removed successfully'
         });
     } catch (error) {
-        res.status(500).json({
-            success: false,
-            sessionId: resolvedId,
-            error: 'rm failed',
-            details: error.stderr || error.message || String(error)
-        });
+        // If file doesn't exist, return success anyway
+        const errorMsg = error.stderr || error.message || '';
+        if (errorMsg.includes('not found') || errorMsg.includes('No such file')) {
+            res.json({
+                success: true,
+                sessionId: resolvedId,
+                path: remotePath,
+                message: 'File already removed or not found'
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                sessionId: resolvedId,
+                error: 'rm failed',
+                details: error.stderr || error.message || String(error)
+            });
+        }
     }
 });
 
@@ -1673,6 +1759,9 @@ app.get('/url', async (req, res) => {
     }
 });
 
+// ============================================
+// LOG - FIXED
+// ============================================
 app.get('/log', async (req, res) => {
     const sessionId = req.query.sessionId;
     const lines = req.query.lines ? parseInt(req.query.lines) : null;
@@ -1697,12 +1786,15 @@ app.get('/log', async (req, res) => {
         const result = await runColabCli(args, null, null, 30000);
         session.lastActivity = Date.now();
         sessions.set(resolvedId, session);
+        
+        const events = result.stdout ? result.stdout.split('\n').filter(e => e.trim()) : [];
+        
         res.json({
             success: true,
             sessionId: resolvedId,
             output: result.stdout || '',
             error: result.stderr || '',
-            events: result.stdout ? result.stdout.split('\n').filter(e => e.trim()) : []
+            events: events
         });
     } catch (error) {
         res.status(500).json({
@@ -2066,7 +2158,7 @@ app.post('/edit', async (req, res) => {
 });
 
 // ============================================
-// FIXED: STATELESS RUN ENDPOINT
+// STATELESS RUN ENDPOINT
 // ============================================
 app.post('/run', async (req, res) => {
     const { script, gpu, keep, timeout, sessionName } = req.body;
@@ -2099,7 +2191,6 @@ print("✅ Script completed!")
         logInfo(`Created temporary script: ${actualScript}`);
     }
 
-    // Use a unique session name for the run
     const uniqueSessionName = sessionName || `run_${Date.now().toString(36)}`;
     const args = ['run', actualScript];
     if (gpu) args.push('--gpu', gpu);
@@ -2113,7 +2204,6 @@ print("✅ Script completed!")
         // STATELESS: This runs and cleans up automatically via colab run's internal logic
         const result = await runColabCli(args, null, null, 60000);
         
-        // If keep is true, try to get the session URL for the user
         let url = null;
         if (keep) {
             try {
@@ -2176,7 +2266,6 @@ async function gracefulShutdown(signal) {
     shuttingDown = true;
     logInfo(`🛑 ${signal} received — shutting down (${sessions.size} sessions)`);
     
-    // Kill all tracked processes
     for (const [sessionId, procs] of activeProcesses.entries()) {
         for (const proc of procs) {
             try { proc.kill('SIGKILL'); } catch (e) {}
@@ -2215,7 +2304,7 @@ app.use((req, res) => {
 // INIT
 // ============================================
 async function init() {
-    logInfo('🚀 Initializing Colab Orchestrator v3.7 (EVICTION & STATELESS RUN)...');
+    logInfo('🚀 Initializing Colab Orchestrator v3.8 (TOKEN CACHING & ALL FIXES)...');
 
     await initColabBinary();
     await fs.mkdir(CONFIG.SESSIONS_BASE_DIR, { recursive: true });
@@ -2229,14 +2318,15 @@ async function init() {
 
     const PORT = process.env.PORT || CONFIG.PORT;
     app.listen(PORT, () => {
-        logSuccess(`🚀 Colab Orchestrator v3.7 running on port ${PORT}`);
+        logSuccess(`🚀 Colab Orchestrator v3.8 running on port ${PORT}`);
         logInfo(`📁 Sessions: ${CONFIG.SESSIONS_BASE_DIR}`);
         logInfo(`📊 Max sessions: ${CONFIG.MAX_SESSIONS}`);
         logInfo(`🔧 Colab binary: ${COLAB_BINARY}${USE_PYTHON_MODULE ? ' (-m colab_cli)' : ''}`);
-        logInfo(`\n📡 Health: http://localhost:${PORT}/health`);
-        logInfo(`📖 Help: http://localhost:${PORT}/`);
+        logInfo(`🔑 Token caching: Enabled (refreshes only when expired)`);
         logInfo(`🔄 Auto-eviction: Enabled (oldest session evicted when limit reached)`);
         logInfo(`⚡ /run: Stateless (does not count toward session limit)`);
+        logInfo(`\n📡 Health: http://localhost:${PORT}/health`);
+        logInfo(`📖 Help: http://localhost:${PORT}/`);
         logSuccess('\n🚀 Ready!');
     });
 }
