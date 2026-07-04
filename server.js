@@ -467,7 +467,7 @@ function startHousekeeping() {
 }
 
 // ============================================
-// SESSION DATA JSON MANAGEMENT
+// SESSION DATA JSON MANAGEMENT - MODIFIED to overwrite
 // ============================================
 async function appendSessionData(sessionId, data) {
     const dataFile = path.join(CONFIG.SESSIONS_BASE_DIR, sessionId, 'session_data.json');
@@ -487,6 +487,7 @@ async function appendSessionData(sessionId, data) {
             };
         }
 
+        // Check if cell already exists, REPLACE it (overwrite) instead of append
         const existingIndex = sessionData.cells.findIndex(c => c.cellNo === data.cellNo && c.type === data.type);
         if (existingIndex !== -1) {
             sessionData.cells[existingIndex] = data;
@@ -516,9 +517,9 @@ async function getSessionData(sessionId) {
 }
 
 // ============================================
-// CODE EXECUTION ENGINE
+// CODE EXECUTION ENGINE - MODIFIED to accept timeout
 // ============================================
-async function executeCodeInColab(sessionId, cellNo, code, executionId) {
+async function executeCodeInColab(sessionId, cellNo, code, executionId, customTimeout = null) {
     const session = sessions.get(sessionId);
     if (!session) throw new Error('Session not found');
 
@@ -531,6 +532,9 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         status: 'running'
     };
 
+    // Use custom timeout if provided, otherwise use default
+    const timeoutSeconds = customTimeout || CONFIG.EXECUTION_TIMEOUT;
+
     try {
         if (Buffer.byteLength(code, 'utf8') > CONFIG.MAX_CODE_SIZE) {
             throw new Error(`Code exceeds ${CONFIG.MAX_CODE_SIZE} bytes`);
@@ -539,23 +543,36 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
         const codeFile = path.join(CONFIG.SESSIONS_BASE_DIR, sessionId, `code_${cellNo}.py`);
         await fs.writeFile(codeFile, code, 'utf8');
 
-        const args = ['exec', '-s', session.colabSession, '--timeout', CONFIG.EXECUTION_TIMEOUT.toString()];
-        const result = await runColabCli(args, sessionId, code, CONFIG.EXECUTION_TIMEOUT * 1000);
+        const args = ['exec', '-s', session.colabSession, '--timeout', timeoutSeconds.toString()];
+        const result = await runColabCli(args, sessionId, code, timeoutSeconds * 1000);
 
         const completedAt = Date.now();
         const executionTime = completedAt - startedAt;
 
-        const output = {
+        // Truncate output if it's too large (more than 50KB)
+        let output = result.stdout || '(No output)';
+        let errorOutput = result.stderr || '';
+        const MAX_OUTPUT_SIZE = 50 * 1024; // 50KB
+        
+        if (output.length > MAX_OUTPUT_SIZE) {
+            output = output.substring(0, MAX_OUTPUT_SIZE) + `\n... (truncated, ${output.length} total bytes)`;
+        }
+        if (errorOutput.length > MAX_OUTPUT_SIZE) {
+            errorOutput = errorOutput.substring(0, MAX_OUTPUT_SIZE) + `\n... (truncated, ${errorOutput.length} total bytes)`;
+        }
+
+        const outputData = {
             status: 'completed',
-            output: result.stdout || '(No output)',
-            error: result.stderr || '',
+            output: output,
+            error: errorOutput,
             startedAt,
             completedAt,
             executionTime,
-            timestamp: completedAt
+            timestamp: completedAt,
+            fullOutputSize: result.stdout ? result.stdout.length : 0
         };
 
-        completedExecutions.set(executionId, output);
+        completedExecutions.set(executionId, outputData);
 
         const updatedSession = sessions.get(sessionId);
         if (updatedSession?.currentExecution?.executionId === executionId) {
@@ -564,17 +581,33 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             sessions.set(sessionId, updatedSession);
         }
 
-        cellData = { ...cellData, status: 'completed', completedAt: new Date(completedAt).toISOString(), executionTime, output: result.stdout || '(No output)', error: result.stderr || '' };
+        // Store truncated output in session data
+        cellData = { 
+            ...cellData, 
+            status: 'completed', 
+            completedAt: new Date(completedAt).toISOString(), 
+            executionTime, 
+            output: output, 
+            error: errorOutput
+        };
         await appendSessionData(sessionId, cellData);
 
         logSuccess(`Execution ${executionId.substring(0, 12)} completed in ${executionTime}ms`);
-        return output;
+        return outputData;
     } catch (error) {
         const completedAt = Date.now();
+        
+        // Truncate error output if too large
+        let errorMsg = error.stderr || error.message || String(error);
+        const MAX_OUTPUT_SIZE = 50 * 1024;
+        if (errorMsg.length > MAX_OUTPUT_SIZE) {
+            errorMsg = errorMsg.substring(0, MAX_OUTPUT_SIZE) + `\n... (truncated, ${errorMsg.length} total bytes)`;
+        }
+        
         const failureResult = {
             status: 'failed',
             output: error.stdout || '',
-            error: error.stderr || error.message || String(error),
+            error: errorMsg,
             startedAt,
             completedAt,
             executionTime: completedAt - startedAt,
@@ -590,7 +623,14 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
             sessions.set(sessionId, updatedSession);
         }
 
-        cellData = { ...cellData, status: 'failed', completedAt: new Date(completedAt).toISOString(), executionTime: completedAt - startedAt, output: error.stdout || '', error: error.stderr || error.message || String(error) };
+        cellData = { 
+            ...cellData, 
+            status: 'failed', 
+            completedAt: new Date(completedAt).toISOString(), 
+            executionTime: completedAt - startedAt, 
+            output: error.stdout || '', 
+            error: errorMsg
+        };
         await appendSessionData(sessionId, cellData);
 
         logError(`Execution ${executionId.substring(0, 12)} failed:`, error.message || error.error?.message);
@@ -598,13 +638,13 @@ async function executeCodeInColab(sessionId, cellNo, code, executionId) {
     }
 }
 
-async function backgroundExecution(sessionId, cellNo, code, executionId) {
+async function backgroundExecution(sessionId, cellNo, code, executionId, timeout = null) {
     const execKey = `${sessionId}_${cellNo}`;
     if (executionQueue.has(execKey)) return;
     executionQueue.add(execKey);
     logInfo(`Queued execution ${executionId.substring(0, 12)}`);
     try {
-        await executeCodeInColab(sessionId, cellNo, code, executionId);
+        await executeCodeInColab(sessionId, cellNo, code, executionId, timeout);
     } catch (error) {
         logError(`Background error for ${executionId.substring(0, 12)}:`, error.message || error.error?.message);
     } finally {
@@ -657,7 +697,7 @@ app.get('/', (req, res) => {
             delete: { method: "DELETE", path: "/session/:sessionId" },
             keepalive: { method: "POST", path: "/keepalive", body: { sessionId: "required" } },
             restartKernel: { method: "POST", path: "/restart-kernel", body: { sessionId: "required" } },
-            exec: { method: "POST", path: "/exec", body: { sessionId: "required", code: "required", cellNo: "required" } },
+            exec: { method: "POST", path: "/exec", body: { sessionId: "required", code: "required", cellNo: "required", timeout: "optional" } },
             execStatus: { method: "GET/POST", path: "/exec-status", params: { sessionId: "required", executionId: "required" } },
             execAck: { method: "POST", path: "/exec-ack", body: { executionId: "required" } },
             install: { method: "POST", path: "/install", body: { sessionId: "required", packages: "optional" } },
@@ -981,11 +1021,11 @@ app.post('/keepalive', requireAuth, async (req, res) => {
 });
 
 // ============================================
-// EXECUTION ENDPOINTS
+// EXECUTION ENDPOINTS - MODIFIED to accept timeout
 // ============================================
 
 app.post('/exec', requireAuth, async (req, res) => {
-    const { sessionId, code, cellNo } = req.body;
+    const { sessionId, code, cellNo, timeout } = req.body;
     
     const validCellNo = parseInt(cellNo, 10);
     if (!sessionId || !code || isNaN(validCellNo) || validCellNo < 0) {
@@ -1009,6 +1049,16 @@ app.post('/exec', requireAuth, async (req, res) => {
 
     const executionId = generateId(16);
 
+    // Validate and parse timeout (if provided)
+    let execTimeout = null;
+    if (timeout !== undefined && timeout !== null) {
+        const parsedTimeout = parseInt(timeout, 10);
+        if (!isNaN(parsedTimeout) && parsedTimeout > 0) {
+            execTimeout = parsedTimeout;
+            logInfo(`Using custom timeout: ${execTimeout}s for execution ${executionId.substring(0, 12)}`);
+        }
+    }
+
     logInfo(`Execution ${executionId.substring(0, 12)} | session ${resolvedId.substring(0, 12)} | cell ${validCellNo}`);
 
     session.status = 'busy';
@@ -1031,13 +1081,15 @@ app.post('/exec', requireAuth, async (req, res) => {
         status: 'started'
     });
 
-    backgroundExecution(resolvedId, validCellNo, code, executionId);
+    // Pass timeout to background execution
+    backgroundExecution(resolvedId, validCellNo, code, executionId, execTimeout);
 
     res.json({
         status: 'processing',
         sessionId: resolvedId,
         executionId,
         pollInterval: CONFIG.POLL_INTERVAL,
+        timeout: execTimeout || CONFIG.EXECUTION_TIMEOUT,
         message: 'Code execution started. Poll /exec-status for results.'
     });
 });
