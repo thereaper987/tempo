@@ -21,6 +21,7 @@ const execPromise = util.promisify(exec);
 // ============================================
 const allowedOrigins = [
     'https://kushalkumarj2006.github.io',
+    'https://thereaper987.github.io',
     'https://tempo-agxk.onrender.com'
 ];
 
